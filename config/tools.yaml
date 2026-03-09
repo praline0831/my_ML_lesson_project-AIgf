@@ -1,0 +1,18 @@
+tools:
+  - name: web_search
+    description: Search the web for information
+    module: skills/web-search
+    params:
+      query: string
+
+  - name: calculator
+    description: Perform mathematical calculations
+    module: skills/calculator
+    params:
+      expression: string
+
+  - name: file_read
+    description: Read content from a file
+    module: skills/file-read
+    params:
+      path: string

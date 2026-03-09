@@ -1,0 +1,24 @@
+{
+  "name": "your-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A modular AI agent system with gateway, runtime, and multimodal interfaces",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:gateway": "cd apps/gateway && npm run dev",
+    "dev:runtime": "cd apps/runtime && npm run dev",
+    "dev:desktop": "cd apps/desktop && npm run dev",
+    "dev:web": "cd apps/web && npm run dev",
+    "build": "lerna run build",
+    "test": "lerna run test"
+  },
+  "devDependencies": {
+    "lerna": "^7.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

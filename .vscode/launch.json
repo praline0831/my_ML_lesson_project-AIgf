@@ -1,0 +1,62 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Launch Gateway",
+      "skipFiles": ["<node_internals>/**"],
+      "runtimeArgs": ["--nolazy", "--experimental-vm-modules"],
+      "preLaunchTask": "tsc: build - apps/gateway",
+      "program": "${workspaceFolder}/apps/gateway/src/index.ts",
+      "outFiles": ["${workspaceFolder}/apps/gateway/dist/**/*.js"]
+    },
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Launch Runtime",
+      "skipFiles": ["<node_internals>/**"],
+      "preLaunchTask": "tsc: build - apps/runtime",
+      "program": "${workspaceFolder}/apps/runtime/src/index.ts",
+      "outFiles": ["${workspaceFolder}/apps/runtime/dist/**/*.js"]
+    },
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Launch Desktop (Main)",
+      "skipFiles": ["<node_internals>/**"],
+      "preLaunchTask": "tsc: build - apps/desktop",
+      "program": "${workspaceFolder}/apps/desktop/src/main.ts",
+      "outFiles": ["${workspaceFolder}/apps/desktop/dist/**/*.js"]
+    },
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Launch Desktop (Renderer)",
+      "skipFiles": ["<node_internals>/**"],
+      "preLaunchTask": "tsc: build - apps/desktop",
+      "program": "${workspaceFolder}/apps/desktop/src/renderer.ts",
+      "outFiles": ["${workspaceFolder}/apps/desktop/dist/**/*.js"]
+    },
+    {
+      "type": "pwa-chrome",
+      "request": "launch",
+      "name": "Launch Web (Chrome)",
+      "url": "http://localhost:5173",
+      "webRoot": "${workspaceFolder}/apps/web/src",
+      "preLaunchTask": "vite: dev - apps/web"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Full Stack (Gateway + Runtime)",
+      "configurations": ["Launch Gateway", "Launch Runtime"],
+      "presentation": { "hidden": false, "group": "fullstack" }
+    },
+    {
+      "name": "Desktop App",
+      "configurations": ["Launch Desktop (Main)", "Launch Desktop (Renderer)"],
+      "presentation": { "hidden": false, "group": "desktop" }
+    }
+  ]
+}
