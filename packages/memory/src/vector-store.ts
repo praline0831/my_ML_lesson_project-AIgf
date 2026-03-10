@@ -1,23 +1,65 @@
-// Vector storage and similarity search
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
+import { v4 as uuidv4 } from "uuid";
 
-export interface VectorEmbedding {
-  id: string;
-  vector: number[];
-  metadata?: Record<string, unknown>;
-}
-
-export class VectorStore {
-  private embeddings: VectorEmbedding[] = [];
-
-  async add(id: string, vector: number[], metadata?: Record<string, unknown>): Promise<void> {
-    this.embeddings.push({ id, vector, metadata });
+/**
+ * LangChain 兼容的 Embeddings 实现
+ */
+class LangChainEmbeddings {
+  async _embed(texts: string[]): Promise<number[][]> {
+    const embeddings: number[][] = [];
+    for (const text of texts) {
+      const res = await fetch("http://localhost:11434/api/embeddings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "dmeta-embedding-zh",
+          prompt: text,
+        }),
+      });
+      if (!res.ok) throw new Error("Ollama Embeddings failed");
+      const data = await res.json();
+      embeddings.push(data.embedding);
+    }
+    return embeddings;
   }
 
-  async search(vector: number[], limit = 5): Promise<VectorEmbedding[]> {
-    // Placeholder for cosine similarity search
-    return this.embeddings
-      .slice()
-      .sort(() => 0.5 - Math.random())
-      .slice(0, limit);
+  async embedQuery(text: string): Promise<number[]> {
+    return (await this._embed([text]))[0];
+  }
+
+  async embedDocuments(documents: string[]): Promise<number[][]> {
+    return await this._embed(documents);
+  }
+}
+
+export class LocalVectorStore {
+  private store: MemoryVectorStore;
+
+  constructor() {
+    this.store = new MemoryVectorStore(new LangChainEmbeddings());
+  }
+
+  async add(text: string, role: "user" | "ai" | "fact" | "event"): Promise<void> {
+    await this.store.addDocuments([{
+      pageContent: `[${role.toUpperCase()}] ${text}`,
+      metadata: { role, timestamp: Date.now() },
+      id: uuidv4(),
+    }]);
+  }
+
+  async search(query: string, k: number = 3): Promise<string[]> {
+    // 先 embed query
+    const embeddings = new LangChainEmbeddings();
+    const queryEmbedding = await embeddings.embedQuery(query);
+
+    // 用 _queryVectors 检索（这是 protected 方法，但可以调用）
+    // LangChain v0.3 的 _queryVectors 返回带 similarity 的结果
+    const results = await (this.store as any)._queryVectors(queryEmbedding, k);
+
+    return results.map((r: any) => r.content);
+  }
+
+  async clear(): Promise<void> {
+    this.store = new MemoryVectorStore(new LangChainEmbeddings());
   }
 }
