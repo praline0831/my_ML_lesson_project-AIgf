@@ -13,6 +13,10 @@ export interface ReactLoopCallbacks {
      */
     think: (context: Message[]) => Promise<string>;
     /**
+     * 流式调用 LLM（可选）。若提供则 runStream 时使用，用于边生成边推送
+     */
+    thinkStream?: (context: Message[]) => ReadableStream<string>;
+    /**
      * 解析 LLM 响应，判断是否为工具调用
      *
      * @param response LLM 原始响应
@@ -54,6 +58,13 @@ export declare class ReactLoop {
      * 执行 ReAct 循环
      */
     run(): Promise<{
+        output: string;
+        messages: Message[];
+    }>;
+    /**
+     * 流式执行：在每轮回复时通过 onChunk 推送 token。需要 callbacks 提供 thinkStream。
+     */
+    runStream(onChunk?: (chunk: string) => void): Promise<{
         output: string;
         messages: Message[];
     }>;

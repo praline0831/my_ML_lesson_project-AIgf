@@ -10,6 +10,9 @@
     "clean": "rm -rf dist",
     "test": "tsx src/test.ts"
   },
+  "dependencies": {
+    "@agent/memory": "*"
+  },
   "devDependencies": {
     "tsx": "^4.16.2",
     "typescript": "^5.9.3"

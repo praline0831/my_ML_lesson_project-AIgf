@@ -1,6 +1,9 @@
 import { LLMProvider } from './llm.js';
 import { ReactLoop, ReactLoopCallbacks } from './react-loop.js';
 import { AgentConfig, AgentResult, Message, MessageType } from './types.js';
+// ✅ 使用包名别名
+import { RAGMemoryService } from '@agent/memory';
+// …其余代码不变…
 
 // 工具注册表
 type ToolRegistry = Record<string, (args: Record<string, unknown>) => Promise<unknown>>;
@@ -16,6 +19,7 @@ type ToolRegistry = Record<string, (args: Record<string, unknown>) => Promise<un
  */
 export abstract class Agent {
   protected messages: Message[] = [];
+  protected memory?: RAGMemoryService;
   protected config: AgentConfig;
   protected toolRegistry: ToolRegistry = {};
   protected reactLoop?: ReactLoop;
@@ -25,6 +29,7 @@ export abstract class Agent {
   constructor(config: AgentConfig = {}) {
     this.config = { maxSteps: 10, verbose: false, ...config };
     this.verbose = this.config.verbose ?? false;
+    this.memory = new RAGMemoryService();
   }
 
   /**
@@ -48,25 +53,60 @@ export abstract class Agent {
    */
   public async run(input: string): Promise<AgentResult> {
     try {
-      // 1. 添加用户输入
+      // 1. 添加用户输入到历史
       this.addMessage(MessageType.Human, input);
 
-      // 2. 创建 ReactLoop（传入 callbacks）
+      // 2a. 从记忆中检索相关内容
+      let context = this.getRecentMessages(10); // 最近对话作为初始上下文
+      if (this.memory) {
+        // 简单检索：得到字符串数组
+        const relevant = await this.memory.getRelevantMemories(input, 3);
+        console.log('📚 简单检索结果:', relevant);
+
+        // —— 使用 getRetriever ——（内存包的类型可能未同步，为避免编译错误先转成 any）
+        const retriever = (this.memory as any).getRetriever({ k: 5, searchType: 'mmr' });
+
+        // ① 直接调用检索
+        const docs = await retriever.getRelevantDocuments(input);
+        console.log('🔍 retriever 文档：', docs);
+        // 可以将 docs 拼接到 context 或传给 LLM
+        // 这里我们把检索出的文档当作工具消息插入；
+        context = context.concat(docs.map((d: any) => ({ type: MessageType.Tool, content: d.pageContent || d.content || String(d) })));
+
+        // ② 注册为工具，让模型在 ReactLoop 里可自主检索
+        this.registerTool('retrieve', async ({ query }) =>
+          retriever.getRelevantDocuments(query as string)
+        );
+
+        // ③（可选）创建一个 LangChain 链，一次性完成 RAG
+        // import { ConversationalRetrievalQAChain } from 'langchain/chains';
+        // import { ChatMessageHistory } from 'langchain/stores/message/in_memory';
+        // const qa = ConversationalRetrievalQAChain.fromLLM(this.llm!, retriever, {
+        //   memory: new ChatMessageHistory(),
+        // });
+        // const qaRes = await qa.call({ question: input, chat_history: context });
+        // console.log('📘 通过链获得答案：', qaRes.text);
+      }
+
+      // 2b. 组装 ReactLoop（回调由子类实现）
       this.reactLoop = new ReactLoop(
         this.config.maxSteps ?? 10,
         this.createCallbacks()
       );
 
-      // 3. 将历史消息添加到 ReactLoop
+      // 3. 将消息历史添加到循环
       for (const msg of this.messages) {
         this.reactLoop.addMessage(msg);
       }
 
-      // 4. 执行循环
+      // 4. 运行思考循环
       const result = await this.reactLoop.run();
 
-      // 5. 添加 AI 最终回复
+      // 5. 存储输出并更新记忆
       this.addMessage(MessageType.AI, result.output);
+      if (this.memory) {
+        await this.memory.addTurn(input, result.output);
+      }
 
       return {
         finalOutput: result.output,

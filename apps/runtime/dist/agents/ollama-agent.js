@@ -14,6 +14,9 @@ export class OllamaAgent extends Agent {
             think: async (context) => {
                 return await this.callLLM(context);
             },
+            thinkStream: (context) => {
+                return this.llmProvider.generateStream(context, this.config.systemPrompt);
+            },
             parseToolCall: (response) => {
                 // 示例：简单解析 JSON 格式的工具调用
                 try {

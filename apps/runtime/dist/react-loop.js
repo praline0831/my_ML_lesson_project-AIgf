@@ -64,6 +64,50 @@ export class ReactLoop {
         };
     }
     /**
+     * 流式执行：在每轮回复时通过 onChunk 推送 token。需要 callbacks 提供 thinkStream。
+     */
+    async runStream(onChunk) {
+        const thinkStream = this.callbacks.thinkStream;
+        if (!thinkStream) {
+            return this.run();
+        }
+        while (this.stepCount < this.maxSteps) {
+            const context = this.getContext();
+            const stream = thinkStream(context);
+            let buffer = '';
+            const reader = stream.getReader();
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done)
+                        break;
+                    buffer += value;
+                    onChunk?.(value);
+                }
+            }
+            finally {
+                reader.releaseLock();
+            }
+            const toolCall = this.callbacks.parseToolCall(buffer);
+            if (toolCall) {
+                const result = await this.callbacks.executeTool(toolCall.name, toolCall.args);
+                this.messages.push({
+                    type: MessageType.ToolResult,
+                    content: String(result),
+                    timestamp: Date.now()
+                });
+                this.stepCount++;
+            }
+            else {
+                return { output: buffer, messages: this.messages };
+            }
+        }
+        return {
+            output: `已达到最大步数 (${this.maxSteps})，任务未完成`,
+            messages: this.messages
+        };
+    }
+    /**
      * 获取执行步数（用于统计）
      */
     getStepCount() {

@@ -1,6 +1,7 @@
 import { LLMProvider } from './llm.js';
 import { ReactLoop, ReactLoopCallbacks } from './react-loop.js';
 import { AgentConfig, AgentResult, Message, MessageType } from './types.js';
+import { RAGMemoryService } from '@agent/memory';
 type ToolRegistry = Record<string, (args: Record<string, unknown>) => Promise<unknown>>;
 /**
  * Agent 基类
@@ -13,6 +14,7 @@ type ToolRegistry = Record<string, (args: Record<string, unknown>) => Promise<un
  */
 export declare abstract class Agent {
     protected messages: Message[];
+    protected memory?: RAGMemoryService;
     protected config: AgentConfig;
     protected toolRegistry: ToolRegistry;
     protected reactLoop?: ReactLoop;
@@ -28,6 +30,10 @@ export declare abstract class Agent {
      * 核心执行入口
      */
     run(input: string): Promise<AgentResult>;
+    /**
+     * 流式执行：通过 onChunk 逐段推送 AI 回复，适合 SSE/Web 实时展示
+     */
+    runStream(input: string, onChunk: (chunk: string) => void): Promise<AgentResult>;
     /**
      * 添加消息（内部使用）
      */
