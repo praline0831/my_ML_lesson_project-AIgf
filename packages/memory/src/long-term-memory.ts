@@ -33,6 +33,15 @@ export class LongTermMemory {
   }
 
   /**
+   * 直接返回 LangChain Retriever 对象。调用者可以使用它执行
+   * 向量检索，或者将其传给 LangChain 链 (RetrievalQAChain 等)，
+   * 无需手动拼接 prompt。
+   */
+  getRetriever(options?: any) {
+    return this.vectorStore.getRetriever(options);
+  }
+
+  /**
    * 清空长期记忆
    */
   async clear(): Promise<void> {

@@ -67,6 +67,13 @@ export class RAGMemoryService {
   }
 
   /**
+   * 获取长期记忆对应的 Retriever，可直接用于 LangChain 的检索链。
+   */
+  getRetriever(options?: any) {
+    return this.longTerm.getRetriever(options);
+  }
+
+  /**
    * 清空所有记忆
    */
   async clear(): Promise<void> {

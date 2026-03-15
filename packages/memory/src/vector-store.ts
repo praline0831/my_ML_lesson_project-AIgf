@@ -12,7 +12,7 @@ class LangChainEmbeddings {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "dmeta-embedding-zh",
+          model: "shaw/dmeta-embedding-zh:latest",
           prompt: text,
         }),
       });
@@ -61,5 +61,14 @@ export class LocalVectorStore {
 
   async clear(): Promise<void> {
     this.store = new MemoryVectorStore(new LangChainEmbeddings());
+  }
+
+  /**
+   * 返回 LangChain Retriever 实例，可用于链或作为工具。
+   * `options` 与 `MemoryVectorStore.asRetriever` 参数一致，如 `{ k, searchType, filter }`。
+   * 这里不指定具体返回类型以避免类型依赖问题。
+   */
+  getRetriever(options?: any) {
+    return this.store.asRetriever(options as any);
   }
 }
