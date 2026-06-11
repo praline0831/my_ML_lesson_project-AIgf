@@ -1,0 +1,23 @@
+{
+  "name": "@agent/memory",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test:short": "node --loader tsx src/test-short-term.ts",
+    "test:long": "node --loader tsx src/test-long-term.ts",
+    "test:rag": "node --loader tsx src/test-rag-memory.ts",
+    "test": "node --loader tsx src/test-short-term.ts && node --loader tsx src/test-long-term.ts && node --loader tsx src/test-rag-memory.ts"
+  },
+  "dependencies": {
+    "@langchain/core": "^0.3.27",
+    "@langchain/ollama": "^0.1.6",
+    "langchain": "^0.3.6",
+    "uuid": "^11.0.5"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}
