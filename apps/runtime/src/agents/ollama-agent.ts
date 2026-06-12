@@ -1,13 +1,16 @@
 import { Agent } from '../agent.js';
 import { OllamaClient } from '../providers/ollama.js';
-import { ReactLoopCallbacks } from '../react-loop.js';
 import { AgentConfig, Message } from '../types.js';
 
 /**
  * Ollama Agent 实现
+ *
+ * 通过覆盖父类方法适配 Ollama 特定行为：
+ * - callLLM: 错误处理（连接失败提示）
+ * - parseToolCall: 解析 Ollama 输出的 JSON 格式工具调用
  */
 export class OllamaAgent extends Agent {
-    private llmProvider: OllamaClient; // ← 改为具体类型
+    private llmProvider: OllamaClient;
 
     constructor(config: AgentConfig, llmProvider: OllamaClient) {
         super(config);
@@ -15,43 +18,8 @@ export class OllamaAgent extends Agent {
         this.configureLLM(llmProvider);
     }
 
-    protected createCallbacks(): ReactLoopCallbacks {
-        // ✅ 保存 this 引用（OllamaAgent 实例）
-        const self = this;
-
-        return {
-            think: async (context: Message[]): Promise<string> => {
-                return await self.llm!.generateText(context, self.config.systemPrompt);
-            },
-            thinkStream: async function* (this: OllamaAgent, context: Message[]) {
-                if (!self.llm?.generateStream) {
-                    throw new Error("LLM provider does not support streaming.");
-                }
-                yield* self.llm.generateStream(context, self.config.systemPrompt);
-            },
-            parseToolCall: (response: string) => {
-                // 示例：简单解析 JSON 格式的工具调用
-                try {
-                    const parsed = JSON.parse(response);
-                    if (parsed.action && parsed.action === 'tool_call') {
-                        return {
-                            name: parsed.action_input.name,
-                            args: parsed.action_input.args
-                        };
-                    }
-                } catch {
-                    // 不是 JSON 格式，视为文本回复
-                }
-                return null;
-            },
-            executeTool: async (name: string, args: Record<string, unknown>) => {
-                return await self.callTool(name, args);
-            }
-        };
-    }
-
     /**
-     * 覆盖 callLLM 方法，处理 Ollama 特定逻辑（如重试、错误处理）
+     * Ollama 特定的错误处理
      */
     protected async callLLM(messages: Message[]): Promise<string> {
         try {
@@ -62,5 +30,28 @@ export class OllamaAgent extends Agent {
             }
             throw error;
         }
+    }
+
+    /**
+     * 解析 Ollama 风格的工具调用
+     * 期望格式: {"action": "tool_call", "action_input": {"name": "...", "args": {...}}}
+     */
+    protected parseToolCall(response: string): { name: string; args: Record<string, unknown> } | null {
+        try {
+            // 1. 先尝试在 <tool> 标签里找 JSON
+            const tagMatch = response.match(/<tool>([\s\S]*?)<\/tool>/);
+            const jsonStr = tagMatch ? tagMatch[1] : response;
+            const parsed = JSON.parse(jsonStr);
+
+            if (parsed.action === 'tool_call' && parsed.action_input) {
+                return {
+                    name: parsed.action_input.name,
+                    args: parsed.action_input.args ?? {},
+                };
+            }
+        } catch {
+            // 不是 JSON，视为普通文本
+        }
+        return null;
     }
 }

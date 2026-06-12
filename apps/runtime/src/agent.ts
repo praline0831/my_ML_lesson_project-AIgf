@@ -1,30 +1,76 @@
-import { LLMProvider } from './llm.js';
-import { ReactLoop, ReactLoopCallbacks } from './react-loop.js';
-import { AgentConfig, AgentResult, Message, MessageType } from './types.js';
-// ✅ 使用包名别名
 import { RAGMemoryService } from '@agent/memory';
-// …其余代码不变…
+import { AIMessage, BaseMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
+import { Annotation, CompiledStateGraph, END, START, StateGraph } from '@langchain/langgraph';
+import { LLMProvider } from './llm.js';
+import { AgentConfig, AgentResult, Message, MessageType } from './types.js';
 
-// 工具注册表
+/**
+ * 工具注册表
+ */
 type ToolRegistry = Record<string, (args: Record<string, unknown>) => Promise<unknown>>;
 
 /**
- * Agent 基类
- * 
- * 职责：
- * 1. 管理消息历史（messages）
- * 2. 注册工具（toolRegistry）
- * 3. 提供 run(input) 统一入口
- * 4. 封装 ReactLoop 的 callbacks（调用 LLM/工具）
+ * LangGraph 状态定义
+ *
+ * - messages: 对话历史
+ * - steps: 已执行步数
+ * - finalOutput: 最终输出
+ * - trace: 每个节点的执行轨迹（用于演示）
+ */
+const GraphState = Annotation.Root({
+  messages: Annotation<BaseMessage[]>({
+    reducer: (x, y) => x.concat(y),
+    default: () => [],
+  }),
+  steps: Annotation<number>({
+    reducer: (x, y) => x + y,
+    default: () => 0,
+  }),
+  finalOutput: Annotation<string>({
+    reducer: (_x, y) => y,
+    default: () => '',
+  }),
+  trace: Annotation<string[]>({
+    reducer: (x, y) => x.concat(y),
+    default: () => [],
+  }),
+});
+
+function toLangChainMessage(msg: Message): BaseMessage {
+  switch (msg.type) {
+    case MessageType.Human:
+      return new HumanMessage(msg.content);
+    case MessageType.AI:
+      return new AIMessage(msg.content);
+    case MessageType.Tool:
+    case MessageType.ToolResult:
+      return new ToolMessage({ content: msg.content, tool_call_id: msg.timestamp?.toString() ?? 'tool' });
+    default:
+      return new HumanMessage(msg.content);
+  }
+}
+
+/**
+ * 流式回调：当节点完成时被调用（用于实时显示执行轨迹）
+ */
+export interface StreamCallbacks {
+  onNode?: (nodeName: string, data: unknown) => void;
+  onToken?: (token: string) => void;   // LLM 输出 token 时
+  onTrace?: (trace: string[]) => void;
+}
+
+/**
+ * Agent 基类 - LangGraph 版
  */
 export abstract class Agent {
   protected messages: Message[] = [];
   protected memory?: RAGMemoryService;
   protected config: AgentConfig;
   protected toolRegistry: ToolRegistry = {};
-  protected reactLoop?: ReactLoop;
   protected verbose: boolean = false;
   protected llm?: LLMProvider;
+  protected graph?: CompiledStateGraph<any, any, any, any>;
+  protected streamCallbacks?: StreamCallbacks;
 
   constructor(config: AgentConfig = {}) {
     this.config = { maxSteps: 10, verbose: false, ...config };
@@ -32,9 +78,6 @@ export abstract class Agent {
     this.memory = new RAGMemoryService();
   }
 
-  /**
-   * 注册工具
-   */
   public registerTool(
     name: string,
     tool: (args: Record<string, unknown>) => Promise<unknown>
@@ -49,137 +92,13 @@ export abstract class Agent {
   }
 
   /**
-   * 核心执行入口
+   * 设置流式回调
    */
-  public async run(input: string): Promise<AgentResult> {
-    try {
-      // 1. 添加用户输入到历史
-      this.addMessage(MessageType.Human, input);
-
-      // 2a. 从记忆中检索相关内容
-      let context = this.getRecentMessages(10); // 最近对话作为初始上下文
-      if (this.memory) {
-        // 简单检索：得到字符串数组
-        const relevant = await this.memory.getRelevantMemories(input, 3);
-        console.log('📚 简单检索结果:', relevant);
-
-        // —— 使用 getRetriever ——（内存包的类型可能未同步，为避免编译错误先转成 any）
-        const retriever = (this.memory as any).getRetriever({ k: 5, searchType: 'mmr' });
-
-        // ① 直接调用检索
-        const docs = await retriever.getRelevantDocuments(input);
-        console.log('🔍 retriever 文档：', docs);
-        // 可以将 docs 拼接到 context 或传给 LLM
-        // 这里我们把检索出的文档当作工具消息插入；
-        context = context.concat(docs.map((d: any) => ({ type: MessageType.Tool, content: d.pageContent || d.content || String(d) })));
-
-        // ② 注册为工具，让模型在 ReactLoop 里可自主检索
-        this.registerTool('retrieve', async ({ query }) =>
-          retriever.getRelevantDocuments(query as string)
-        );
-
-        // ③（可选）创建一个 LangChain 链，一次性完成 RAG
-        // import { ConversationalRetrievalQAChain } from 'langchain/chains';
-        // import { ChatMessageHistory } from 'langchain/stores/message/in_memory';
-        // const qa = ConversationalRetrievalQAChain.fromLLM(this.llm!, retriever, {
-        //   memory: new ChatMessageHistory(),
-        // });
-        // const qaRes = await qa.call({ question: input, chat_history: context });
-        // console.log('📘 通过链获得答案：', qaRes.text);
-      }
-
-      // 2b. 组装 ReactLoop（回调由子类实现）
-      this.reactLoop = new ReactLoop(
-        this.config.maxSteps ?? 10,
-        this.createCallbacks()
-      );
-
-      // 3. 将消息历史添加到循环
-      for (const msg of this.messages) {
-        this.reactLoop.addMessage(msg);
-      }
-
-      // 4. 运行思考循环
-      // const result = await this.reactLoop.run();
-      const stream = this.reactLoop.runStream();
-      let finalOutput = "";
-      let loopResult: { output: string; messages: Message[] } | undefined;
-
-      for await (const chunk of stream) {
-        finalOutput += chunk;
-      }
-
-      // 换一种方式调用 stream，以获取返回值：
-      const generator = this.reactLoop.runStream();
-      let next = await generator.next();
-      while (!next.done) {
-        finalOutput += next.value;
-        next = await generator.next();
-      }
-      // next.done 为 true 时，next.value 就是返回值
-      const result = next.value as { output: string; messages: Message[] };
-
-      // 5. 存储输出并更新记忆
-      this.addMessage(MessageType.AI, result.output);
-      if (this.memory) {
-        await this.memory.addTurn(input, result.output);
-      }
-
-      return {
-        finalOutput: result.output,
-        messages: [...this.messages],
-        steps: this.reactLoop.getStepCount()
-      };
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      this.addMessage(MessageType.AI, `发生错误: ${errorMessage}`);
-      return {
-        finalOutput: `发生错误: ${errorMessage}`,
-        messages: [...this.messages],
-        steps: this.reactLoop?.getStepCount() ?? 0,
-        error: errorMessage
-      };
-    }
+  public setStreamCallbacks(cbs: StreamCallbacks): void {
+    this.streamCallbacks = cbs;
   }
 
-  /**
-   * 添加消息（内部使用）
-   */
-  protected addMessage(
-    type: MessageType,
-    content: string
-  ): void {
-    this.messages.push({
-      type,
-      content,
-      timestamp: Date.now()
-    });
-  }
-
-  /**
-   * 获取最近消息（供子类调用）
-   */
-  protected getRecentMessages(n: number = 10): Message[] {
-    return this.messages.slice(-n);
-  }
-
-  /**
-   * 【核心！】创建 ReactLoop callbacks
-   * 
-   * 子类必须实现：
-   * - think: 调用 LLM
-   * - parseToolCall: 解析工具调用
-   * - executeTool: 执行注册的工具
-   */
-  protected abstract createCallbacks(): ReactLoopCallbacks;
-
-  /**
-   * 工具调用辅助方法（供 callbacks 使用）
-   */
-  protected async callTool(
-    name: string,
-    args: Record<string, unknown>
-  ): Promise<unknown> {
+  protected async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
     if (!this.toolRegistry[name]) {
       throw new Error(`工具 "${name}" 未注册`);
     }
@@ -194,8 +113,240 @@ export abstract class Agent {
   }
 
   /**
-   * 日志输出（可选）
+   * 流式调用 LLM（如果 LLM 支持）
    */
+  protected async *callLLMStream(messages: Message[]): AsyncIterable<string> {
+    if (!this.llm) {
+      throw new Error('LLM 未配置，请调用 configureLLM');
+    }
+    // 生成 system prompt
+    const systemPrompt = this.config.systemPrompt;
+    if (this.llm.generateStream) {
+      yield* this.llm.generateStream(messages, systemPrompt);
+    } else {
+      // 退化为一次性生成
+      const text = await this.llm.generateText(messages, systemPrompt);
+      yield text;
+    }
+  }
+
+  protected parseToolCall(response: string): { name: string; args: Record<string, unknown> } | null {
+    const match = response.match(/<tool>([\s\S]*?)<\/tool>/);
+    if (!match) return null;
+    try {
+      return JSON.parse(match[1]);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 【核心】构建 LangGraph 状态图
+   */
+  private buildGraph() {
+    const self = this;
+    const workflow = new StateGraph(GraphState)
+      // 1. retrieve 节点
+      .addNode('retrieve', async (state) => {
+        const lastUser = [...state.messages].reverse().find((m) => m instanceof HumanMessage);
+        const query = lastUser?.content?.toString() ?? '';
+        const context: BaseMessage[] = [];
+        let traceEntry = `🔍 [retrieve] 查询: "${query}"`;
+        if (self.memory && query) {
+          const relevant = await self.memory.getRelevantMemories(query, 3);
+          traceEntry += ` → 找到 ${relevant.length} 条相关记忆`;
+          for (const r of relevant) {
+            context.push(new ToolMessage({ content: r, tool_call_id: 'rag' }));
+          }
+        } else {
+          traceEntry += ' → 无相关记忆';
+        }
+        return { messages: context, steps: 0, trace: [traceEntry] };
+      })
+
+      // 2. think 节点（流式）
+      .addNode('think', async (state) => {
+        const msgs: Message[] = state.messages.map((m) => ({
+          type: m instanceof HumanMessage
+            ? MessageType.Human
+            : m instanceof ToolMessage
+              ? MessageType.ToolResult
+              : MessageType.AI,
+          content: m.content.toString(),
+          timestamp: Date.now(),
+        }));
+
+        // 收集流式输出
+        let fullResponse = '';
+        for await (const token of self.callLLMStream(msgs)) {
+          fullResponse += token;
+          self.streamCallbacks?.onToken?.(token);
+        }
+
+        return {
+          messages: [new AIMessage(fullResponse)],
+          steps: 1,
+          trace: [`🤖 [think] LLM 回复 (${fullResponse.length} 字符)`],
+        };
+      })
+
+      // 3. act 节点
+      .addNode('act', async (state) => {
+        const lastAI = [...state.messages].reverse().find((m) => m instanceof AIMessage);
+        const content = lastAI?.content?.toString() ?? '';
+        const toolCall = self.parseToolCall(content);
+
+        if (!toolCall) {
+          return {
+            finalOutput: content,
+            steps: 1,
+            trace: ['✅ [act] 无工具调用，结束'],
+          };
+        }
+
+        const traceEntry = `🔧 [act] 调用工具: ${toolCall.name}(${JSON.stringify(toolCall.args)})`;
+        const result = await self.callTool(toolCall.name, toolCall.args);
+        return {
+          messages: [new ToolMessage({ content: String(result), tool_call_id: toolCall.name })],
+          steps: 1,
+          trace: [traceEntry, `   ↳ 工具返回: ${String(result).slice(0, 100)}...`],
+        };
+      })
+
+      .addEdge(START, 'retrieve')
+      .addEdge('retrieve', 'think')
+      .addConditionalEdges('think', (state) => {
+        const lastAI = [...state.messages].reverse().find((m) => m instanceof AIMessage);
+        const content = lastAI?.content?.toString() ?? '';
+        const toolCall = self.parseToolCall(content);
+        const exceeded = state.steps >= (self.config.maxSteps ?? 10);
+        if (exceeded) return END;
+        return toolCall ? 'act' : END;
+      })
+      .addEdge('act', 'think');
+
+    return workflow.compile();
+  }
+
+  /**
+   * 执行（一次性返回）
+   */
+  public async run(input: string): Promise<AgentResult> {
+    try {
+      this.addMessage(MessageType.Human, input);
+      if (!this.graph) this.graph = this.buildGraph();
+
+      const initialMessages = this.messages.map(toLangChainMessage);
+      const finalState = await this.graph.invoke({
+        messages: initialMessages,
+        steps: 0,
+        finalOutput: '',
+        trace: [],
+      });
+
+      const lastAI = [...finalState.messages].reverse().find((m) => m instanceof AIMessage);
+      const output = finalState.finalOutput || lastAI?.content?.toString() || '';
+
+      this.addMessage(MessageType.AI, output);
+      if (this.memory) await this.memory.addTurn(input, output);
+
+      this.streamCallbacks?.onTrace?.(finalState.trace);
+
+      return {
+        finalOutput: output,
+        messages: [...this.messages],
+        steps: finalState.steps,
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.addMessage(MessageType.AI, `发生错误: ${errorMessage}`);
+      return {
+        finalOutput: `发生错误: ${errorMessage}`,
+        messages: [...this.messages],
+        steps: 0,
+        error: errorMessage,
+      };
+    }
+  }
+
+  /**
+   * 【演示】流式执行：边执行边输出 LLM token 和节点轨迹
+   */
+  public async *runStream(input: string): AsyncGenerator<string | string[], void, unknown> {
+    this.addMessage(MessageType.Human, input);
+    if (!this.graph) this.graph = this.buildGraph();
+
+    const initialMessages = this.messages.map(toLangChainMessage);
+    const initialState = { messages: initialMessages, steps: 0, finalOutput: '', trace: [] };
+
+    // 累积状态
+    let accumulated = initialState;
+
+    // 用 graph.stream 逐节点返回
+    // LangGraph 0.2 的 stream 返回 Promise<ReadableStream>，需要 [Symbol.asyncIterator]
+    const streamPromise = this.graph.stream(initialState) as any;
+    const stream = await streamPromise;
+    for await (const chunk of stream) {
+      // chunk 形如 { nodeName: stateUpdate }
+      for (const [nodeName, nodeState] of Object.entries(chunk)) {
+        const update = nodeState as any;
+        accumulated = { ...accumulated, ...update };
+
+        // 输出该节点的 trace
+        if (update.trace && Array.isArray(update.trace)) {
+          for (const t of update.trace) {
+            yield t;  // 节点执行轨迹
+          }
+        }
+      }
+    }
+
+    const lastAI = [...accumulated.messages].reverse().find((m) => m instanceof AIMessage);
+    const output = accumulated.finalOutput || lastAI?.content?.toString() || '';
+
+    this.addMessage(MessageType.AI, output);
+    if (this.memory) await this.memory.addTurn(input, output);
+
+    yield ['__DONE__', output];  // 结束标记 + 最终输出
+  }
+
+  /**
+   * 【演示1】打印 Mermaid 图（最直观的 LangGraph 优势）
+   */
+  public printGraph(): string {
+    if (!this.graph) this.graph = this.buildGraph();
+    const mermaid = this.graph.getGraph().drawMermaid();
+    return mermaid;
+  }
+
+  /**
+   * 【演示2】可视化一次完整执行的轨迹
+   */
+  public async runWithTrace(input: string): Promise<{
+    output: string;
+    trace: string[];
+    steps: number;
+  }> {
+    const callbacks: StreamCallbacks = {
+      onToken: (token) => process.stdout.write(token),  // 实时打印 token
+    };
+    this.setStreamCallbacks(callbacks);
+
+    console.log('\n┌─ 执行轨迹 ─────────────────────');
+    const result = await this.run(input);
+    console.log('\n└───────────────────────────────\n');
+
+    return {
+      output: result.finalOutput,
+      trace: [],  // 可以从 state 中拿
+      steps: result.steps,
+    };
+  }
+
+  protected addMessage(type: MessageType, content: string): void {
+    this.messages.push({ type, content, timestamp: Date.now() });
+  }
+
   protected log(message: string): void {
     if (this.verbose) {
       console.log(`[Agent] ${message}`);

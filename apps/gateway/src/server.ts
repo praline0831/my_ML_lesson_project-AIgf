@@ -58,6 +58,73 @@ app.post("/chat", async (req, res) => {
   }
 });
 
+/**
+ * Agent 对话 - SSE 流式接口
+ *
+ * 事件格式：
+ *   data: {"type":"token","content":"你"}\n\n
+ *   data: {"type":"node","name":"retrieve","trace":"..."}\n\n
+ *   data: {"type":"done","output":"...","steps":2}\n\n
+ *   data: {"type":"error","error":"..."}\n\n
+ */
+app.post("/chat/stream", async (req, res) => {
+  try {
+    const { message } = req.body ?? {};
+    if (typeof message !== "string" || !message.trim()) {
+      res.status(400).json({ error: "请提供 message 字符串" });
+      return;
+    }
+
+    // SSE 头
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
+
+    const send = (data: unknown) => {
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    };
+
+    let aiBuffer = "";  // 累积 AI 文本（用于流式追加）
+    let assistantMsgId = crypto.randomUUID();
+    let firstTokenSent = false;
+
+    // 设置流式回调
+    agent.setStreamCallbacks({
+      onToken: (token) => {
+        if (!firstTokenSent) {
+          send({ type: "start", id: assistantMsgId });
+          firstTokenSent = true;
+        }
+        aiBuffer += token;
+        send({ type: "token", content: token });
+      },
+    });
+
+    send({ type: "user", content: message });
+
+    // 流式运行
+    for await (const chunk of agent.runStream(message.trim())) {
+      if (Array.isArray(chunk)) {
+        const [marker, output] = chunk;
+        if (marker === "__DONE__") {
+          send({ type: "done", output, id: assistantMsgId });
+        }
+      } else if (typeof chunk === "string") {
+        // 节点 trace
+        send({ type: "node", trace: chunk });
+      }
+    }
+
+    res.end();
+  } catch (err) {
+    console.error("[Gateway] /chat/stream 错误:", err);
+    res.write(`data: ${JSON.stringify({ type: "error", error: err instanceof Error ? err.message : String(err) })}\n\n`);
+    res.end();
+  }
+});
+
 /** 搜索 ArXiv */
 app.get("/papers/search", async (req, res) => {
   try {

@@ -1,4 +1,11 @@
+import "highlight.js/styles/github.css";
+import "katex/dist/katex.min.css";
 import { useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import rehypeHighlight from "rehype-highlight";
+import rehypeKatex from "rehype-katex";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 
 const API_BASE = import.meta.env.VITE_GATEWAY_URL ?? "http://localhost:4000";
 
@@ -231,24 +238,73 @@ export function PaperApp() {
     setInput("");
     const userMsg: Message = { id: crypto.randomUUID(), role: "user", content: text };
     setMessages((prev) => [...prev, userMsg]);
+
+    // 占位消息（流式会不断更新）
+    const assistantId = crypto.randomUUID();
+    setMessages((prev) => [
+      ...prev,
+      { id: assistantId, role: "assistant", content: "" },
+    ]);
+
     setLoading(true);
     setTimeout(scrollToBottom, 100);
+
     try {
-      const res = await fetch(`${API_BASE}/chat`, {
+      const res = await fetch(`${API_BASE}/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: text }),
       });
-      const data = await res.json();
-      setMessages((prev) => [
-        ...prev,
-        { id: crypto.randomUUID(), role: "assistant", content: data.reply || data.error || "无响应" },
-      ]);
+
+      if (!res.body) throw new Error("无响应流");
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const events = buffer.split("\n\n");
+        buffer = events.pop() ?? "";
+
+        for (const evt of events) {
+          if (!evt.startsWith("data: ")) continue;
+          try {
+            const payload = JSON.parse(evt.slice(6));
+            if (payload.type === "token") {
+              // 逐 token 追加内容
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantId
+                    ? { ...m, content: m.content + payload.content }
+                    : m
+                )
+              );
+              setTimeout(scrollToBottom, 0);
+            } else if (payload.type === "node") {
+              // 节点 trace - 在消息内容里加个标记
+              console.log("[Node]", payload.trace);
+            } else if (payload.type === "done") {
+              console.log("[Stream done]", payload.output?.slice(0, 80));
+            } else if (payload.type === "error") {
+              throw new Error(payload.error);
+            }
+          } catch (e) {
+            console.error("Parse error:", e);
+          }
+        }
+      }
     } catch (e) {
-      setMessages((prev) => [
-        ...prev,
-        { id: crypto.randomUUID(), role: "assistant", content: `网络错误: ${e instanceof Error ? e.message : String(e)}` },
-      ]);
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === assistantId
+            ? { ...m, content: `网络错误: ${e instanceof Error ? e.message : String(e)}` }
+            : m
+        )
+      );
     } finally {
       setLoading(false);
       setTimeout(scrollToBottom, 100);
@@ -261,6 +317,7 @@ export function PaperApp() {
 
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto", padding: 20, fontFamily: "system-ui, sans-serif" }}>
+      <style>{`@keyframes blink { 0%, 50% { opacity: 0.5; } 51%, 100% { opacity: 0; } }`}</style>
       <header style={{ marginBottom: 20, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <div>
           <h1 style={{ margin: 0, color: "#1a73e8" }}>📚 论文研究助手</h1>
@@ -438,9 +495,12 @@ export function PaperApp() {
                 与论文助手对话，例如："帮我搜索 LoRA 相关论文"
               </p>
             )}
-            {messages.map((m) => (
-              <MessageBubble key={m.id} message={m} />
-            ))}
+            {messages.map((m, idx) => {
+              // 最后一条 assistant 消息 + loading 中 = 流式状态
+              const isLastAssistant = m.role === "assistant" && idx === messages.length - 1;
+              const isStreaming = isLastAssistant && loading;
+              return <MessageBubble key={m.id} message={m} isStreaming={isStreaming} />;
+            })}
             {loading && <div style={{ color: "#999", fontStyle: "italic" }}>🤔 思考中...</div>}
             <div ref={messagesEndRef} />
           </div>
@@ -533,7 +593,7 @@ function PaperCard({ paper }: { paper: ArxivPaper }) {
   );
 }
 
-function MessageBubble({ message }: { message: Message }) {
+function MessageBubble({ message, isStreaming }: { message: Message; isStreaming: boolean }) {
   const isUser = message.role === "user";
   return (
     <div
@@ -553,11 +613,62 @@ function MessageBubble({ message }: { message: Message }) {
           border: isUser ? "none" : "1px solid #e0e0e0",
           fontSize: 14,
           lineHeight: 1.5,
-          whiteSpace: "pre-wrap",
           wordBreak: "break-word",
         }}
       >
-        {message.content}
+        {/* 流式中：纯文本（避免 markdown 解析闪烁）；流结束：渲染 markdown */}
+        {isUser ? (
+          <div style={{ whiteSpace: "pre-wrap" }}>{message.content}</div>
+        ) : isStreaming ? (
+          <div style={{ whiteSpace: "pre-wrap" }}>
+            {message.content}
+            <span style={{ animation: "blink 1s infinite", opacity: 0.5 }}>▊</span>
+          </div>
+        ) : message.content ? (
+          <div className="markdown-body">
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm, remarkMath]}
+              rehypePlugins={[rehypeHighlight, rehypeKatex]}
+              components={{
+                a: ({ node, ...props }: any) => (
+                  <a {...props} target="_blank" rel="noreferrer" style={{ color: "#1a73e8" }} />
+                ),
+                table: ({ node, ...props }: any) => (
+                  <table {...props} style={{ borderCollapse: "collapse", width: "100%", marginTop: 8 }} />
+                ),
+                th: ({ node, ...props }: any) => (
+                  <th {...props} style={{ border: "1px solid #e0e0e0", padding: "6px 10px", background: "#f8f9fa", textAlign: "left" }} />
+                ),
+                td: ({ node, ...props }: any) => (
+                  <td {...props} style={{ border: "1px solid #e0e0e0", padding: "6px 10px" }} />
+                ),
+                code: ({ node, inline, className, children, ...props }: any) =>
+                  inline ? (
+                    <code {...props} style={{ background: "#f1f3f4", padding: "2px 5px", borderRadius: 3, fontSize: 13, fontFamily: "Consolas, Monaco, monospace" }}>
+                      {children}
+                    </code>
+                  ) : (
+                    <code {...props} className={className} style={{ display: "block", background: "#f6f8fa", padding: 10, borderRadius: 6, overflowX: "auto", fontSize: 13 }}>
+                      {children}
+                    </code>
+                  ),
+                pre: ({ node, ...props }: any) => (
+                  <pre {...props} style={{ background: "#f6f8fa", padding: 12, borderRadius: 6, overflowX: "auto", fontSize: 13, margin: "8px 0" }} />
+                ),
+                ul: ({ node, ...props }: any) => <ul {...props} style={{ paddingLeft: 22, margin: "6px 0" }} />,
+                ol: ({ node, ...props }: any) => <ol {...props} style={{ paddingLeft: 22, margin: "6px 0" }} />,
+                h1: ({ node, ...props }: any) => <h1 {...props} style={{ fontSize: 22, marginTop: 12, marginBottom: 8, fontWeight: 600 }} />,
+                h2: ({ node, ...props }: any) => <h2 {...props} style={{ fontSize: 18, marginTop: 12, marginBottom: 6, fontWeight: 600 }} />,
+                h3: ({ node, ...props }: any) => <h3 {...props} style={{ fontSize: 16, marginTop: 10, marginBottom: 4, fontWeight: 600 }} />,
+                blockquote: ({ node, ...props }: any) => (
+                  <blockquote {...props} style={{ borderLeft: "3px solid #d0d7de", paddingLeft: 12, margin: "6px 0", color: "#57606a" }} />
+                ),
+              }}
+            >
+              {message.content}
+            </ReactMarkdown>
+          </div>
+        ) : null}
         {message.report && (
           <ResearchReportView
             report={message.report}
