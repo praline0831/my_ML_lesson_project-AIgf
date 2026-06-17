@@ -2,12 +2,13 @@ import { RAGMemoryService } from '@agent/memory';
 import { AIMessage, BaseMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import { Annotation, CompiledStateGraph, END, START, StateGraph } from '@langchain/langgraph';
 import { LLMProvider } from './llm.js';
+import { Skill, SkillContext, SkillsManager } from './skills/index.js';
 import { AgentConfig, AgentResult, Message, MessageType } from './types.js';
 
 /**
  * 工具注册表
  */
-type ToolRegistry = Record<string, (args: Record<string, unknown>) => Promise<unknown>>;
+export type ToolRegistry = Record<string, (args: Record<string, unknown>) => Promise<unknown>>;
 
 /**
  * LangGraph 状态定义
@@ -71,6 +72,8 @@ export abstract class Agent {
   protected llm?: LLMProvider;
   protected graph?: CompiledStateGraph<any, any, any, any>;
   protected streamCallbacks?: StreamCallbacks;
+  /** Skill 管理器（Claude 风格） */
+  protected skills: SkillsManager = new SkillsManager();
 
   constructor(config: AgentConfig = {}) {
     this.config = { maxSteps: 10, verbose: false, ...config };
@@ -92,6 +95,51 @@ export abstract class Agent {
   }
 
   /**
+   * 注册一个 Skill
+   */
+  public registerSkill(skill: Skill): void {
+    this.skills.register(skill);
+    this.log(`已注册 Skill: ${skill.name}`);
+  }
+
+  /**
+   * 激活一个 Skill（之后其 instructions 会注入到 LLM 的 system prompt）
+   */
+  public activateSkill(name: string): void {
+    this.skills.activate(name);
+    this.log(`已激活 Skill: ${name}`);
+  }
+
+  /**
+   * 停用一个 Skill
+   */
+  public deactivateSkill(name: string): void {
+    this.skills.deactivate(name);
+    this.log(`已停用 Skill: ${name}`);
+  }
+
+  /**
+   * 直接获取 SkillsManager（高级用法：例如想自定义 invoke 上下文）
+   */
+  public getSkillsManager(): SkillsManager {
+    return this.skills;
+  }
+
+  /**
+   * 构建 Skill 调用的上下文（供内部节点使用）
+   */
+  protected buildSkillContext(): SkillContext {
+    if (!this.llm) {
+      throw new Error('LLM 未配置，请先调用 configureLLM');
+    }
+    return {
+      llm: this.llm,
+      tools: this.toolRegistry,
+      agent: this,
+    };
+  }
+
+  /**
    * 设置流式回调
    */
   public setStreamCallbacks(cbs: StreamCallbacks): void {
@@ -109,7 +157,17 @@ export abstract class Agent {
     if (!this.llm) {
       throw new Error('LLM 未配置，请调用 configureLLM');
     }
-    return await this.llm.generateText(messages, this.config.systemPrompt);
+    return await this.llm.generateText(messages, this.composeSystemPrompt());
+  }
+
+  /**
+   * 组合 system prompt：用户配置的 systemPrompt + 已激活 Skill 的 instructions
+   */
+  protected composeSystemPrompt(): string | undefined {
+    const base = this.config.systemPrompt ?? '';
+    const skillPrompt = this.skills.buildSystemPrompt();
+    if (base && skillPrompt) return `${base}\n\n${skillPrompt}`;
+    return base || (skillPrompt || undefined);
   }
 
   /**
@@ -120,7 +178,7 @@ export abstract class Agent {
       throw new Error('LLM 未配置，请调用 configureLLM');
     }
     // 生成 system prompt
-    const systemPrompt = this.config.systemPrompt;
+    const systemPrompt = this.composeSystemPrompt();
     if (this.llm.generateStream) {
       yield* this.llm.generateStream(messages, systemPrompt);
     } else {
@@ -213,17 +271,67 @@ export abstract class Agent {
         };
       })
 
+      // 4. invoke_skill 节点 - 执行 LLM 在 <skill>...</skill> 中请求的 Skill
+      .addNode('invoke_skill', async (state) => {
+        const lastAI = [...state.messages].reverse().find((m) => m instanceof AIMessage);
+        const content = lastAI?.content?.toString() ?? '';
+        const skillCall = self.skills.parseSkillCall(content);
+
+        if (!skillCall) {
+          // 防御：理论上路由到这里就一定有 <skill>
+          return {
+            finalOutput: content,
+            steps: 1,
+            trace: ['⚠️ [invoke_skill] 路由异常：无 <skill> 标签，回退结束'],
+          };
+        }
+
+        const traceEntry = `🎯 [invoke_skill] 调用 Skill: ${skillCall.name}(${JSON.stringify(skillCall.args)})`;
+        try {
+          const ctx = self.buildSkillContext();
+          const result = await self.skills.invoke(skillCall.name, skillCall.args, ctx);
+          return {
+            messages: [
+              new ToolMessage({
+                content: typeof result === 'string' ? result : JSON.stringify(result),
+                tool_call_id: `skill:${skillCall.name}`,
+              }),
+            ],
+            steps: 1,
+            trace: [
+              traceEntry,
+              `   ↳ Skill 返回: ${String(result).slice(0, 100)}${String(result).length > 100 ? '...' : ''}`,
+            ],
+          };
+        } catch (e) {
+          const errMsg = e instanceof Error ? e.message : String(e);
+          return {
+            messages: [
+              new ToolMessage({
+                content: `Skill "${skillCall.name}" 执行失败: ${errMsg}`,
+                tool_call_id: `skill:${skillCall.name}:error`,
+              }),
+            ],
+            steps: 1,
+            trace: [traceEntry, `   ↳ 错误: ${errMsg}`],
+          };
+        }
+      })
+
       .addEdge(START, 'retrieve')
       .addEdge('retrieve', 'think')
       .addConditionalEdges('think', (state) => {
         const lastAI = [...state.messages].reverse().find((m) => m instanceof AIMessage);
         const content = lastAI?.content?.toString() ?? '';
-        const toolCall = self.parseToolCall(content);
         const exceeded = state.steps >= (self.config.maxSteps ?? 10);
         if (exceeded) return END;
-        return toolCall ? 'act' : END;
+        // 优先匹配 <skill>，其次 <tool>
+        if (self.skills.parseSkillCall(content)) return 'invoke_skill';
+        if (self.parseToolCall(content)) return 'act';
+        return END;
       })
-      .addEdge('act', 'think');
+      .addEdge('act', 'think')
+      .addEdge('invoke_skill', 'think');
 
     return workflow.compile();
   }

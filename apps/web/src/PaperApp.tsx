@@ -6,6 +6,7 @@ import rehypeHighlight from "rehype-highlight";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
+import { AlignApp } from "./AlignApp";
 
 const API_BASE = import.meta.env.VITE_GATEWAY_URL ?? "http://localhost:4000";
 
@@ -53,7 +54,7 @@ export function PaperApp() {
   const [searchQuery, setSearchQuery] = useState("");
   const [researchTopic, setResearchTopic] = useState("");
   const [searchResults, setSearchResults] = useState<ArxivPaper[]>([]);
-  const [activeTab, setActiveTab] = useState<"chat" | "search" | "research">("research");
+  const [activeTab, setActiveTab] = useState<"chat" | "search" | "research" | "align">("research");
   const [researchProgress, setResearchProgress] = useState<string[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -346,6 +347,9 @@ export function PaperApp() {
         <TabButton active={activeTab === "research"} onClick={() => setActiveTab("research")}>
           🔬 深度研究
         </TabButton>
+        <TabButton active={activeTab === "align"} onClick={() => setActiveTab("align")}>
+          🧩 论文-代码对齐
+        </TabButton>
         <TabButton active={activeTab === "search"} onClick={() => setActiveTab("search")}>
           🔍 论文搜索
         </TabButton>
@@ -476,6 +480,8 @@ export function PaperApp() {
           )}
         </div>
       )}
+
+      {activeTab === "align" && <AlignApp />}
 
       {activeTab === "chat" && (
         <div>

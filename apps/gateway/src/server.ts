@@ -1,4 +1,5 @@
 import { arxivService, deepResearchService, generateAnalysisDoc, generateResearchReport, generateSearchResultDoc } from "@agent/paper";
+import { LLMProviderAdapter, PaperAlignAgent } from "@agent/paper-align";
 import { createAgent, paperTools } from "@agent/runtime";
 import cors from "cors";
 import express from "express";
@@ -32,6 +33,8 @@ app.get("/", (_req, res) => {
       websocket: "ws://localhost:PORT (echo)",
       search: "GET /papers/search?q=...&max=10",
       deepResearch: "POST /papers/deep-research { \"topic\": \"...\", \"rounds\": 3, \"per_round\": 8 }",
+      alignRun: "POST /align/run { \"arxiv_id\": \"...\", \"repo_url\": \"...\" } (SSE)",
+      alignExport: "POST /align/export { \"markdown\": \"...\", \"arxiv_id\": \"...\" }",
     },
   });
 });
@@ -277,6 +280,80 @@ app.post("/papers/export-analysis", async (req, res) => {
   }
 });
 
+/**
+ * 论文-代码对齐 - SSE 流式接口
+ *
+ * 事件格式：
+ *   data: {"type":"start", "arxivId": "..."}
+ *   data: {"type":"progress", "stage": "paper|repo|functions|align", "info": "..."}
+ *   data: {"type":"done", "report": {...完整的 AlignmentReport}}
+ *   data: {"type":"error", "error": "..."}
+ */
+app.post("/align/run", async (req, res) => {
+  try {
+    const { arxiv_id, repo_url } = req.body ?? {};
+    if (!arxiv_id || typeof arxiv_id !== "string") {
+      res.status(400).json({ error: "缺少 arxiv_id" });
+      return;
+    }
+
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
+
+    const send = (data: unknown) => {
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    };
+
+    send({ type: "start", arxivId: arxiv_id });
+
+    // 复用 chat agent 的同一个 LLM provider，保证模型/温度/endpoint 完全一致
+    const sharedProvider = agent.getLLMProvider();
+    const alignAgent = new PaperAlignAgent({
+      llm: new LLMProviderAdapter(sharedProvider),
+      onProgress: (stage, info) => {
+        send({ type: "progress", stage, info });
+      },
+    });
+
+    const report = await alignAgent.align(arxiv_id, repo_url);
+
+    send({ type: "done", report });
+    res.end();
+  } catch (err) {
+    console.error("[Gateway] /align/run 错误:", err);
+    res.write(`data: ${JSON.stringify({
+      type: "error",
+      error: err instanceof Error ? err.message : String(err),
+    })}\n\n`);
+    res.end();
+  }
+});
+
+/** 下载对齐报告为 Markdown */
+app.post("/align/export", async (req, res) => {
+  try {
+    const { markdown, arxiv_id } = req.body ?? {};
+    if (typeof markdown !== "string" || !markdown) {
+      res.status(400).json({ error: "缺少 markdown" });
+      return;
+    }
+    const safeId = (arxiv_id || "report").replace(/[^\w.-]/g, "_");
+    const filename = `align-${safeId}-${Date.now()}.md`;
+
+    res.setHeader("Content-Type", "text/markdown; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.send(markdown);
+  } catch (err) {
+    console.error("[Gateway] /align/export 错误:", err);
+    res.status(500).json({
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
 /** WebSocket 简单回显 */
 function startServer(PORT: number): Promise<void> {
   return new Promise((resolve) => {
@@ -300,3 +377,4 @@ function startServer(PORT: number): Promise<void> {
 }
 
 export { startServer };
+

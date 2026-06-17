@@ -19,6 +19,14 @@ export class OllamaAgent extends Agent {
     }
 
     /**
+     * 获取底层 LLM provider（供其他模块复用，如 paper-align agent）
+     * 这样可以保证两个 agent 共用同一个模型配置
+     */
+    public getLLMProvider(): OllamaClient {
+        return this.llmProvider;
+    }
+
+    /**
      * Ollama 特定的错误处理
      */
     protected async callLLM(messages: Message[]): Promise<string> {

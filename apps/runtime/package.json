@@ -12,7 +12,8 @@
   },
   "dependencies": {
     "@agent/memory": "*",
-    "@agent/paper": "*"
+    "@agent/paper": "*",
+    "@agent/paper-align": "*"
   },
   "devDependencies": {
     "tsx": "^4.16.2",
