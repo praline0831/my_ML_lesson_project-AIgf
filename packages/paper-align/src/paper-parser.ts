@@ -1,13 +1,3 @@
-/**
- * 论文解析器
- *
- * 流程：
- *   1. 通过 @agent/paper 拿 arXiv 摘要
- *   2. 尝试拉 ar5iv 渲染版 HTML（比 PDF 友好）
- *   3. 提取正文的纯文本（去标签、保留段落结构）
- *   4. 用 LLM 从中抽取 5-15 个"复现关键声明"
- */
-
 import { arxivService } from '@agent/paper';
 import { LLMClient } from './llm-client.js';
 import type { PaperClaim, ParsedPaper } from './types.js';
@@ -15,26 +5,15 @@ import type { PaperClaim, ParsedPaper } from './types.js';
 const AR5IV_BASE = 'https://ar5iv.labs.arxiv.org/html/';
 
 export interface PaperParserOptions {
-    /** 要抽取的声明数量（默认 8） */
     claimCount?: number;
-    /** 传入自定义 LLM 客户端 */
     llm?: LLMClient;
 }
 
-/**
- * 规范化 arxiv id
- * 支持：
- *   - 2106.09685
- *   - arXiv:2106.09685
- *   - https://arxiv.org/abs/2106.09685
- *   - 2106.09685v1
- */
 export function normalizeArxivId(input: string): string {
     let id = input.trim();
     id = id.replace(/^https?:\/\/arxiv\.org\/(abs|pdf)\//i, '');
     id = id.replace(/^arXiv:/i, '');
     id = id.replace(/\.pdf$/i, '');
-    // 保留版本号，方便后续 fetch
     return id;
 }
 
@@ -43,30 +22,21 @@ export class PaperParser {
 
     constructor(llm: LLMClient, private options: PaperParserOptions = {}) {
         this.llm = llm;
-        this.options = { claimCount: 8, ...options };
+        this.options = { claimCount: 15, ...options };
     }
 
-    /**
-     * 主入口
-     */
     async parse(arxivIdOrUrl: string): Promise<ParsedPaper> {
         const arxivId = normalizeArxivId(arxivIdOrUrl);
-        const baseId = arxivId.replace(/v\d+$/, ''); // 拿摘要不带版本号
+        const baseId = arxivId.replace(/v\d+$/, '');
 
-        // 1) 拿摘要
         const search = await arxivService.search(baseId, 1);
         const meta = search.papers.find(p => p.id.endsWith(baseId)) || search.papers[0];
         if (!meta) {
-            throw new Error(`未找到 arXiv 论文: ${arxivId}`);
+            throw new Error(`arXiv paper not found: ${arxivId}`);
         }
 
-        // 2) 从摘要/comment 抽 GitHub 链接
         const repoUrl = extractRepoUrl(`${meta.abstract}\n${meta.comment ?? ''}`);
-
-        // 3) 拿正文
         const bodyText = await this.fetchBody(arxivId);
-
-        // 4) LLM 抽声明
         const claims = await this.extractClaims(meta.title, bodyText);
 
         return {
@@ -80,9 +50,6 @@ export class PaperParser {
         };
     }
 
-    /**
-     * 拉 ar5iv 全文 → 转纯文本
-     */
     private async fetchBody(arxivId: string): Promise<string> {
         const url = `${AR5IV_BASE}${arxivId}`;
         try {
@@ -90,110 +57,80 @@ export class PaperParser {
                 headers: { 'User-Agent': 'paper-align-agent/0.1' },
             });
             if (!resp.ok) {
-                console.warn(`[paper-parser] ar5iv 返回 ${resp.status}，回退到仅用摘要`);
+                console.warn(`[paper-parser] ar5iv returned ${resp.status}, falling back to abstract only`);
                 return '';
             }
             const html = await resp.text();
             return htmlToText(html);
         } catch (err) {
-            console.warn(`[paper-parser] ar5iv 拉取失败: ${(err as Error).message}`);
+            console.warn(`[paper-parser] ar5iv fetch failed: ${(err as Error).message}`);
             return '';
         }
     }
 
-    /**
-     * 用 LLM 抽取"复现关键"声明
-     */
     private async extractClaims(title: string, bodyText: string): Promise<PaperClaim[]> {
-        // 截断正文，避免超 token
-        const maxChars = 24000;
+        const maxChars = 50000;
         const truncated = bodyText.length > maxChars
-            ? bodyText.slice(0, maxChars) + '\n\n[... truncated ...]'
+            ? smartTruncate(bodyText, maxChars)
             : bodyText;
 
-        if (!truncated) {
-            // 没有正文时退到摘要
+        if (!truncated || truncated.trim().length < 100) {
             return [{
-                description: '（仅有摘要，无法细化声明）',
+                description: '(paper body not available, abstract only)',
                 location: 'abstract',
             }];
         }
 
-        const systemPrompt = `你是一个 ML 论文复现专家，任务是从论文正文中提取**对复现最关键**的技术声明。
+        const systemPrompt = `You are an ML paper reproduction expert. Extract technically critical claims from the paper body that are essential for reproducing the method.
 
-## 什么是"复现关键"
-能在代码中找到对应实现的具体内容：数学公式、算法步骤、损失函数、训练 trick、数据处理逻辑。
-**不是**：实验结果数字（"在 GLUE 上达到 89.2"）、引用文献、概念性讨论、动机说明。
+## What counts as "reproduction-critical"
+Concrete technical details that can be found in code: mathematical formulas, algorithm steps, loss functions, training tricks, model architecture, data processing logic.
+**Not**: experimental results ("achieved 89.2 on GLUE"), citations, conceptual discussion, motivation, related work.
 
-## 分类标签（必填）
-- \`formula\`    数学公式/推导（如 LoRA: W + ΔW = W + BA）
-- \`algorithm\`  算法步骤/伪代码（如 beam search 流程）
-- \`loss\`       损失函数定义
-- \`hyperparam\` 关键超参（学习率、batch size、rank r、warmup steps）
-- \`training\`   训练策略（优化器选择、gradient clip、ema、mixed precision）
-- \`data\`       数据处理/预处理/增强
-- \`arch\`       模型结构细节（层数、hidden size、激活函数、dropout）
+## Required type labels
+- \`formula\`    Mathematical formula or derivation (e.g., LoRA: W + ΔW = W + BA)
+- \`algorithm\`  Algorithm steps, pseudocode, or procedure
+- \`loss\`       Loss function definition (cross-entropy, contrastive loss, etc.)
+- \`hyperparam\` Key hyperparameters (learning rate, batch size, rank r, warmup steps, optimizer betas)
+- \`training\`   Training strategy (optimizer choice, gradient clipping, EMA, mixed precision, scheduling)
+- \`data\`       Data preprocessing, augmentation, or dataset construction
+- \`arch\`       Model architecture (layer types, hidden size, activation, normalization, dropout)
 
-## 重要度（1-3）
-- 3 = 核心方法（论文标题/方法名直接对应的内容）
-- 2 = 关键技术细节（影响复现结果）
-- 1 = 可选项（作者说"也可以用 X 替代"）
+## Importance (1-3)
+- 3 = Core method — directly corresponds to paper title or main contribution
+- 2 = Key technical detail — significantly impacts reproduction results
+- 1 = Optional detail — "can also use X instead" or minor variant
 
-## 提取规则
-1. 每条 claim 必须是**单个具体点**，不要把三件事混成一条
-2. 给出 location（§3.2 / Eq.5 / Table 1 / Algorithm 1），方便回查原文
-3. quote 字段贴**包含关键公式或关键词的原文**（<= 200 字），方便后续 grep
-4. 至少 5 条，最多 ${this.options.claimCount} 条
-5. 优先级：formula > loss > algorithm > training > arch > data > hyperparam
+## Extraction rules
+1. Each claim must be a single specific point — do not merge multiple items into one claim
+2. Always provide location (\`§3.2\`, \`Eq.5\`, \`Table 1\`, \`Algorithm 1\`, \`§4.1\`) for cross-referencing
+3. The quote field must contain the exact text with key formula symbols or terms (<= 250 chars) for later code search
+4. Extract at least 5 claims, maximum \`${this.options.claimCount}\` claims — prefer more over fewer
+5. Priority: formula > loss > algorithm > training > arch > data > hyperparam
+6. For formulas: preserve variable names as they appear in the paper (e.g., W_q, h, z_t, α)
+7. For hyperparameters: always include the exact numeric value and unit where given
 
-## 输出格式（严格 JSON）
+## Output format (strict JSON array)
 {
   "claims": [
     {
-      "description": "一句话核心（中文）",
+      "description": "One-sentence technical description in English",
       "type": "formula|loss|algorithm|hyperparam|training|data|arch",
       "importance": 1|2|3,
-      "location": "§3.2 / Eq.5 / Table 1",
-      "quote": "包含关键公式或关键词的原文片段"
-    }
-  ]
-}
-
-## 示例（LoRA 论文）
-{
-  "claims": [
-    {
-      "description": "LoRA 权重更新用低秩分解 ΔW = BA",
-      "type": "formula",
-      "importance": 3,
-      "location": "§4.1 / Eq.5",
-      "quote": "W0 + ΔW = W0 + BA, where B ∈ R^{d×r}, A ∈ R^{r×k}, and the rank r ≪ min(d, k)"
-    },
-    {
-      "description": "前向传播 h = W0x + BAx",
-      "type": "formula",
-      "importance": 3,
-      "location": "Eq.3",
-      "quote": "h = W0x + ΔWx = W0x + BAx"
-    },
-    {
-      "description": "A 用高斯初始化，B 用零初始化",
-      "type": "hyperparam",
-      "importance": 2,
-      "location": "§4.1",
-      "quote": "A ~ N(0, σ²), B = 0"
+      "location": "§3.2 / Eq.5 / Table 1 / Algorithm 1",
+      "quote": "Exact excerpt with key formula or term"
     }
   ]
 }`;
 
-        const userPrompt = `论文标题：${title}
+        const userPrompt = `Paper title: ${title}
 
-论文正文：
+Paper body:
 """
 ${truncated}
 """
 
-请输出 JSON。`;
+Extract ${this.options.claimCount} technically critical claims as JSON.`;
 
         interface ExtractResult {
             claims: PaperClaim[];
@@ -208,44 +145,99 @@ ${truncated}
     }
 }
 
-/**
- * 从文本中提取 GitHub 仓库链接
- * 修复：贪心正则会吃末尾的句末标点（.,;:!?'"），需要剥掉
- */
 export function extractRepoUrl(text: string): string | undefined {
     const match = text.match(/https?:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/);
     if (!match) return undefined;
     let url = match[0];
-    // 去掉 .git 后缀
     url = url.replace(/\.git$/, '');
-    // 去掉末尾斜杠
     url = url.replace(/\/$/, '');
-    // 去掉末尾的句末标点（贪婪匹配的副作用）
     url = url.replace(/[.,;:!?'")\]}>]+$/, '');
     return url;
 }
 
-/**
- * 简单 HTML → 文本
- * 保留段落结构（双换行），去除所有标签
- */
 function htmlToText(html: string): string {
-    // 移除 script/style
-    let text = html.replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, '');
-    // 段落/换行
-    text = text.replace(/<\/(p|div|li|h[1-6]|tr)>/gi, '\n\n');
+    let text = html;
+
+    text = text.replace(/<(script|style|nav|footer|aside)[^>]*>[\s\S]*?<\/\1>/gi, '');
+
+    text = text.replace(/<math[^>]*>[\s\S]*?<\/math>/gi, (match) => {
+        const annotation = match.match(/<annotation[^>]*>([\s\S]*?)<\/annotation>/i);
+        if (annotation) return ` {math: ${annotation[1].trim()}} `;
+        const tex = match
+            .replace(/<mi[^>]*>([\s\S]*?)<\/mi>/gi, '$1')
+            .replace(/<mo[^>]*>([\s\S]*?)<\/mo>/gi, '$1')
+            .replace(/<mn[^>]*>([\s\S]*?)<\/mn>/gi, '$1')
+            .replace(/<msub[^>]*>([\s\S]*?)<\/msub>/gi, '$1_')
+            .replace(/<msup[^>]*>([\s\S]*?)<\/msup>/gi, '$1^')
+            .replace(/<mfrac[^>]*>([\s\S]*?)<\/mfrac>/gi, '($1)')
+            .replace(/<mrow[^>]*>([\s\S]*?)<\/mrow>/gi, '$1')
+            .replace(/<[^>]+>/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+        if (tex) return ` {math: ${tex}} `;
+        return ' {math} ';
+    });
+
+    text = text.replace(/<pre[^>]*>[\s\S]*?<\/pre>/gi, (match) => {
+        const code = match
+            .replace(/<code[^>]*>/gi, '')
+            .replace(/<\/code>/gi, '')
+            .replace(/<[^>]+>/g, '')
+            .replace(/&amp;/g, '&')
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>')
+            .replace(/&quot;/g, '"')
+            .replace(/&#39;/g, "'")
+            .replace(/&nbsp;/g, ' ');
+        return `\n\n\`\`\`\n${code.trim()}\n\`\`\`\n\n`;
+    });
+
+    text = text.replace(/<(h[1-6])[^>]*>/gi, '\n\n### ');
+    text = text.replace(/<\/(h[1-6])>/gi, '\n\n');
+    text = text.replace(/<\/(p|div|li|blockquote)>/gi, '\n\n');
     text = text.replace(/<br\s*\/?>/gi, '\n');
-    // 去掉所有标签
+    text = text.replace(/<li[^>]*>/gi, '- ');
+    text = text.replace(/<dt[^>]*>/gi, '\n**');
+    text = text.replace(/<\/dt>/gi, '** ');
+    text = text.replace(/<dd[^>]*>/gi, ': ');
+    text = text.replace(/<\/dd>/gi, '\n');
+
+    text = text.replace(/<table[^>]*>/gi, '\n\n');
+    text = text.replace(/<\/table>/gi, '\n\n');
+    text = text.replace(/<tr[^>]*>/gi, '\n| ');
+    text = text.replace(/<\/tr>/gi, ' |');
+    text = text.replace(/<t[dh][^>]*>/gi, '');
+    text = text.replace(/<\/t[dh]>/gi, ' | ');
+
     text = text.replace(/<[^>]+>/g, '');
-    // 解码常见实体
     text = text
         .replace(/&amp;/g, '&')
         .replace(/&lt;/g, '<')
         .replace(/&gt;/g, '>')
         .replace(/&quot;/g, '"')
         .replace(/&#39;/g, "'")
-        .replace(/&nbsp;/g, ' ');
-    // 规范化空白
-    text = text.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n');
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&times;/g, '×')
+        .replace(/&minus;/g, '−')
+        .replace(/&infty;/g, '∞')
+        .replace(/&alpha;/g, 'α')
+        .replace(/&beta;/g, 'β')
+        .replace(/&theta;/g, 'θ')
+        .replace(/&mu;/g, 'μ')
+        .replace(/&sigma;/g, 'σ')
+        .replace(/&phi;/g, 'φ')
+        .replace(/&nabla;/g, '∇')
+        .replace(/&part;/g, '∂');
+
+    text = text.replace(/[ \t]+/g, ' ').replace(/\n{4,}/g, '\n\n');
     return text.trim();
+}
+
+function smartTruncate(text: string, maxChars: number): string {
+    if (text.length <= maxChars) return text;
+    const headEnd = Math.floor(maxChars * 0.6);
+    const tailStart = text.length - Math.floor(maxChars * 0.35);
+    return text.slice(0, headEnd) +
+        '\n\n[... TRUNCATED: middle ' + (tailStart - headEnd) + ' chars omitted ...]\n\n' +
+        text.slice(tailStart);
 }

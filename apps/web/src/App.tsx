@@ -1,5 +1,5 @@
-import { PaperApp } from "./PaperApp";
+import { UnifiedResearchApp } from "./UnifiedResearchApp";
 
 export function App() {
-  return <PaperApp />;
+  return <UnifiedResearchApp />;
 }

@@ -35,6 +35,9 @@ app.get("/", (_req, res) => {
       deepResearch: "POST /papers/deep-research { \"topic\": \"...\", \"rounds\": 3, \"per_round\": 8 }",
       alignRun: "POST /align/run { \"arxiv_id\": \"...\", \"repo_url\": \"...\" } (SSE)",
       alignExport: "POST /align/export { \"markdown\": \"...\", \"arxiv_id\": \"...\" }",
+      memoryStats: "GET /memory/stats",
+      memorySearch: "POST /memory/search { \"query\": \"...\", \"k\": 5 }",
+      memoryRecent: "GET /memory/recent",
     },
   });
 });
@@ -72,7 +75,7 @@ app.post("/chat", async (req, res) => {
  */
 app.post("/chat/stream", async (req, res) => {
   try {
-    const { message } = req.body ?? {};
+    const { message, context } = req.body ?? {};
     if (typeof message !== "string" || !message.trim()) {
       res.status(400).json({ error: "请提供 message 字符串" });
       return;
@@ -107,8 +110,13 @@ app.post("/chat/stream", async (req, res) => {
 
     send({ type: "user", content: message });
 
+    // 构建带上下文的完整消息
+    const fullMessage = context && typeof context === "string" && context.trim()
+      ? `${context}\n\n【用户提问】\n${message.trim()}`
+      : message.trim();
+
     // 流式运行
-    for await (const chunk of agent.runStream(message.trim())) {
+    for await (const chunk of agent.runStream(fullMessage)) {
       if (Array.isArray(chunk)) {
         const [marker, output] = chunk;
         if (marker === "__DONE__") {
@@ -313,12 +321,50 @@ app.post("/align/run", async (req, res) => {
     const sharedProvider = agent.getLLMProvider();
     const alignAgent = new PaperAlignAgent({
       llm: new LLMProviderAdapter(sharedProvider),
+      githubToken: process.env.GITHUB_TOKEN, // 传递 GitHub Token 避免 429 限制
+      proxyUrl: process.env.HTTPS_PROXY || process.env.HTTP_PROXY, // 传递代理配置
       onProgress: (stage, info) => {
         send({ type: "progress", stage, info });
       },
     });
 
     const report = await alignAgent.align(arxiv_id, repo_url);
+
+    // 自动注入对齐结果到 agent 的长期记忆
+    const memory = agent.getMemory();
+    if (memory && report.rows.length > 0) {
+      try {
+        await memory.longTerm.addSummary(
+          report.paper.title,
+          `Aligned ${report.rows.length} claims: ${report.summary.matched} match, ${report.summary.partial} partial, ${report.summary.mismatch} mismatch, ${report.summary.missing} missing`,
+          [report.paper.title],
+        );
+        for (const row of report.rows) {
+          if (row.matchedFunction) {
+            await memory.longTerm.addAlignmentResult(
+              row.claim.description,
+              row.claim.location,
+              row.matchedFunction.name,
+              row.matchedFunction.file,
+              row.status,
+              [report.paper.title],
+            );
+          } else {
+            await memory.longTerm.addAlignmentResult(
+              row.claim.description,
+              row.claim.location,
+              '',
+              '',
+              row.status,
+              [report.paper.title],
+            );
+          }
+        }
+        await memory.save();
+      } catch (e) {
+        console.error('[Memory injection error]', e);
+      }
+    }
 
     send({ type: "done", report });
     res.end();
@@ -351,6 +397,79 @@ app.post("/align/export", async (req, res) => {
     res.status(500).json({
       error: err instanceof Error ? err.message : String(err),
     });
+  }
+});
+
+/** 记忆系统 - 知识库统计 */
+app.get("/memory/stats", async (_req, res) => {
+  try {
+    const memory = agent.getMemory();
+    if (!memory) {
+      res.json({ total: 0, bySource: {}, byType: {} });
+      return;
+    }
+    await memory.initialize();
+    const all = memory.longTerm.getAll();
+    const bySource: Record<string, number> = {};
+    const byType: Record<string, number> = {};
+    for (const item of all) {
+      const s = item.metadata.source || 'unknown';
+      const t = item.metadata.type || 'unknown';
+      bySource[s] = (bySource[s] || 0) + 1;
+      byType[t] = (byType[t] || 0) + 1;
+    }
+    res.json({ total: all.length, bySource, byType });
+  } catch (err) {
+    console.error("[Gateway] /memory/stats 错误:", err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+/** 记忆系统 - 检索 */
+app.post("/memory/search", async (req, res) => {
+  try {
+    const { query, k } = req.body ?? {};
+    if (!query || typeof query !== "string") {
+      res.status(400).json({ error: "缺少 query" });
+      return;
+    }
+    const memory = agent.getMemory();
+    if (!memory) {
+      res.json({ results: [] });
+      return;
+    }
+    await memory.initialize();
+    const results = await memory.longTerm.search(query, k ?? 5);
+    res.json({ results: results.map(r => ({ content: r.content.slice(0, 300), metadata: r.metadata, score: r.score })) });
+  } catch (err) {
+    console.error("[Gateway] /memory/search 错误:", err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+/** 记忆系统 - 最近条目 */
+app.get("/memory/recent", async (_req, res) => {
+  try {
+    const memory = agent.getMemory();
+    if (!memory) {
+      res.json({ items: [] });
+      return;
+    }
+    await memory.initialize();
+    const all = memory.longTerm.getAll();
+    const sorted = all.sort((a, b) => (b.metadata.timestamp as number || 0) - (a.metadata.timestamp as number || 0));
+    const items = sorted.slice(0, 50).map(item => ({
+      id: item.id,
+      content: item.content.slice(0, 200),
+      source: item.metadata.source,
+      type: item.metadata.type,
+      title: item.metadata.title,
+      timestamp: item.metadata.timestamp,
+    }));
+    res.json({ items });
+  } catch (err) {
+    console.error("[Gateway] /memory/recent 错误:", err);
+    res.status(500).json({ error: String(err) });
   }
 });
 

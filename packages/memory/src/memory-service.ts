@@ -1,83 +1,76 @@
-import { LongTermMemory } from "./long-term-memory.js";
-import { ShortTermMemory } from "./short-term-memory.js";
-import { LocalVectorStore } from "./vector-store.js";
+import { LongTermMemory } from './long-term-memory.js';
 
-
-export class MemoryService {
-  private vectorStore: LocalVectorStore;
-
-  constructor() {
-    this.vectorStore = new LocalVectorStore();
-  }
-
-  async addTurn(userMsg: string, aiMsg: string): Promise<void> {
-    await this.vectorStore.add(userMsg, "user");
-    await this.vectorStore.add(aiMsg, "ai");
-  }
-
-  async getRelevantMemories(userQuery: string): Promise<string[]> {
-    return await this.vectorStore.search(userQuery, 2);
-  }
-
-  async clear(): Promise<void> {
-    await this.vectorStore.clear();
-  }
+export interface MemoryConfig {
+    /** Directory to persist vector store JSON */
+    persistDir?: string;
 }
 
 /**
- * RAG Memory Service（短期 + 长期记忆统一管理）
+ * Unified memory service.
+ *
+ * - Short-term memory (conversation context) is handled by the agent's own
+ *   `messages` array in LangGraph state — no separate ShortTermMemory needed.
+ * - Long-term memory: persistent vector store for papers, code, facts, QA.
  */
 export class RAGMemoryService {
-  private shortTerm: ShortTermMemory;
-  private longTerm: LongTermMemory;
+    longTerm: LongTermMemory;
+    private config?: MemoryConfig;
+    private inited = false;
 
-  constructor() {
-    this.shortTerm = new ShortTermMemory();
-    this.longTerm = new LongTermMemory();
-  }
-
-  /**
-   * 添加对话轮次（同时更新短期 + 长期记忆）
-   */
-  async addTurn(userMsg: string, aiMsg: string, facts?: { key: string; value: string }[]): Promise<void> {
-    // 更新短期记忆
-    await this.shortTerm.addUserMessage(userMsg);
-    await this.shortTerm.addAIMessage(aiMsg);
-
-    // 更新长期记忆（如果有事实）
-    if (facts) {
-      for (const fact of facts) {
-        await this.longTerm.addFact(fact.key, fact.value);
-      }
+    constructor(config?: MemoryConfig) {
+        this.config = config;
+        this.longTerm = new LongTermMemory();
     }
-  }
 
-  /**
-   * 获取短期记忆（对话上下文）
-   */
-  async getShortTermMemory(): Promise<any[]> {
-    return await this.shortTerm.getMessages();
-  }
+    async initialize(): Promise<void> {
+        if (this.inited) return;
+        await this.longTerm.initialize();
+        this.inited = true;
+    }
 
-  /**
-   * 检索长期记忆（RAG）
-   */
-  async getRelevantMemories(query: string, k: number = 3): Promise<string[]> {
-    return await this.longTerm.search(query, k);
-  }
+    private async ensureInit(): Promise<void> {
+        if (!this.inited) await this.initialize();
+    }
 
-  /**
-   * 获取长期记忆对应的 Retriever，可直接用于 LangChain 的检索链。
-   */
-  getRetriever(options?: any) {
-    return this.longTerm.getRetriever(options);
-  }
+    /**
+     * Add a single conversation turn as a QA memory entry.
+     */
+    async addTurn(userMsg: string, aiMsg: string, tags?: string[]): Promise<void> {
+        await this.ensureInit();
+        if (!userMsg || !aiMsg) return;
+        await this.longTerm.addQa(userMsg, aiMsg, tags);
+        await this.longTerm.save();
+    }
 
-  /**
-   * 清空所有记忆
-   */
-  async clear(): Promise<void> {
-    await this.shortTerm.clear();
-    await this.longTerm.clear();
-  }
+    /**
+     * Retrieve relevant memories for a user query (RAG).
+     */
+    async getRelevantMemories(query: string, k: number = 5): Promise<string[]> {
+        await this.ensureInit();
+        const results = await this.longTerm.search(query, k);
+        return results.map(r => r.content);
+    }
+
+    /**
+     * Get formatted context string for injection into the LLM prompt.
+     */
+    async buildContext(query: string, k: number = 3): Promise<string> {
+        await this.ensureInit();
+        const results = await this.longTerm.search(query, k);
+        if (results.length === 0) return '';
+        const lines = results.map((r, i) =>
+            `[${i + 1}] (${r.metadata.source as string}/${r.metadata.type as string}) ${r.content}`,
+        );
+        return `\n## Relevant Knowledge\n${lines.join('\n')}\n`;
+    }
+
+    async clear(): Promise<void> {
+        await this.ensureInit();
+        this.longTerm.clear();
+    }
+
+    async save(): Promise<void> {
+        await this.ensureInit();
+        await this.longTerm.save();
+    }
 }

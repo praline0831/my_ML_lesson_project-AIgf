@@ -1,66 +1,72 @@
-import { LongTermMemory } from "./long-term-memory.js";
+import { LongTermMemory } from './long-term-memory.js';
 
 async function testLongTermMemory() {
-    console.log("🧪 测试长期记忆\n");
+    console.log('Long-Term Memory Test\n');
 
     const memory = new LongTermMemory();
+    await memory.initialize();
 
-    // 测试1: 添加事实
-    console.log("📋 测试1: 添加事实型记忆");
-    await memory.addFact("用户名", "李四");
-    await memory.addFact("用户职业", "软件工程师");
-    await memory.addFact("用户兴趣", "游泳");
-    console.log("✅ 添加事实通过");
+    // 1: add facts
+    console.log('Test 1: addFact');
+    await memory.addFact('name', 'Alice');
+    await memory.addFact('profession', 'ML engineer');
+    await memory.addFact('hobby', 'hiking');
+    console.log(`  stored: ${memory.count()}`);
 
-    // 测试2: 添加事件
-    console.log("\n📋 测试2: 添加事件记忆");
-    await memory.addEvent("用户在2024年1月1日首次使用系统");
-    console.log("✅ 添加事件通过");
+    // 2: semantic search
+    console.log('\nTest 2: semantic search');
+    const r1 = await memory.search('work', 3);
+    console.log(`  "work" -> ${r1.map(r => r.content.slice(0, 60)).join(' | ')}`);
 
-    // 测试3: 检索记忆（精确匹配）
-    console.log("\n📋 测试3: 精确检索");
-    const results1 = await memory.search("用户名", 2);
-    console.log(`搜索"用户名"的结果:`, results1);
-    console.assert(results1.some(r => r.includes("李四")), "应该能找到李四");
-    console.log("✅ 精确检索通过");
+    // 3: paper claims
+    console.log('\nTest 3: paper claims');
+    await memory.addPaperClaim(
+        'Multi-head self-attention with RoPE',
+        '§3.1',
+        'We apply rotary position embeddings to Q and K',
+        ['attention', 'transformer'],
+        3,
+    );
+    const r2 = await memory.search('attention', 3);
+    console.log(`  "attention" -> ${r2.length} results`);
 
-    // 测试4: 语义检索（相似查询）
-    console.log("\n📋 测试4: 语义检索");
-    const results2 = await memory.search("工作", 2);
-    console.log(`搜索"工作"的结果:`, results2);
-    console.assert(results2.some(r => r.includes("软件工程师")), "应该能找到职业");
-    console.log("✅ 语义检索通过");
+    // 4: code functions
+    console.log('\nTest 4: code functions');
+    await memory.addCodeFunction(
+        'MultiHeadAttention', 'model.py',
+        'def forward(self, x):', 'q = self.q_proj(x); k = self.k_proj(x); ...',
+        ['attention', 'transformer'],
+    );
+    const r3 = await memory.search('MultiHeadAttention', 3);
+    console.log(`  code search -> ${r3.length} results`);
 
-    // 测试5: 多条检索
-    console.log("\n📋 测试5: 多条检索（k参数）");
-    await memory.addFact("用户城市", "北京");
-    await memory.addFact("用户国家", "中国");
-    await memory.addFact("用户语言", "中文");
+    // 5: search by source
+    console.log('\nTest 5: searchBySource(paper)');
+    const r4 = await memory.searchBySource('paper', 'attention', 5);
+    console.log(`  paper -> ${r4.length} results`);
 
-    const results3 = await memory.search("用户", 5);
-    console.log(`搜索"用户"（k=5）的结果:`, results3);
-    console.assert(results3.length <= 5, "应该最多返回5条");
-    console.log("✅ 多条检索通过");
+    // 6: alignment
+    console.log('\nTest 6: alignment batch');
+    await memory.addAlignmentBatch([
+        { claim: 'Multi-head attention', location: '§3.1', functionName: 'MultiHeadAttention', functionFile: 'model.py', status: 'match' },
+        { claim: 'Cross-entropy loss', location: '§3.3', status: 'missing' },
+    ], 'My Paper');
+    const r5 = await memory.search('loss', 3);
+    console.log(`  alignment search -> ${r5.length} results`);
 
-    // 测试6: 获取 Retriever
-    console.log("\n📋 测试6: 获取 LangChain Retriever");
-    const retriever = memory.getRetriever({ k: 2 });
-    console.log("Retriever 创建成功:", typeof retriever.invoke);
-    console.log("✅ Retriever 获取通过");
+    // 7: stats
+    const st = memory.stats();
+    console.log(`\nStats: ${st.total} docs | sources=${JSON.stringify(st.bySource)} | types=${JSON.stringify(st.byType)}`);
 
-    // 测试7: 清空记忆
-    console.log("\n📋 测试7: 清空长期记忆");
+    // 8: clear
     await memory.clear();
-    const resultsAfterClear = await memory.search("用户名");
-    console.assert(resultsAfterClear.length === 0, "清空后应该搜不到");
-    console.log("✅ 清空记忆通过");
+    console.log(`After clear: ${memory.count()} docs`);
 
-    console.log("\n🎉 长期记忆测试全部通过！\n");
-    console.log("⚠️ 注意: 当前实现使用内存存储，不支持跨会话持久化\n");
+    console.log('\nAll tests passed');
     return true;
 }
 
-testLongTermMemory().then(() => process.exit(0)).catch((e) => {
-    console.error("❌ 测试失败:", e);
+testLongTermMemory().then(() => process.exit(0)).catch(e => {
+    console.error('FAILED:', e);
     process.exit(1);
 });

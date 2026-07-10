@@ -52,10 +52,9 @@ export abstract class BaseLLMClient implements LLMProvider {
     protected buildMessages(messages: Message[], systemPrompt?: string): Message[] {
         const fullMessages: Message[] = [];
 
-        // 添加系统提示
         if (systemPrompt) {
             fullMessages.push({
-                type: MessageType.AI,
+                type: MessageType.System,
                 content: systemPrompt,
                 timestamp: Date.now()
             });

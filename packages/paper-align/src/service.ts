@@ -1,67 +1,95 @@
-/**
- * 论文-代码对齐 Agent - 主服务
- *
- * 用法：
- *   const agent = new PaperAlignAgent({ llm });
- *   const report = await agent.align('2106.09685');
- *   console.log(report.markdown);
- */
-
 import { Aligner } from './aligner.js';
-import { KeyFunctionSelector } from './key-function-selector.js';
+import { extractPythonFunctions } from './key-function-selector.js';
 import { LLMClient, defaultLLMClient } from './llm-client.js';
 import { PaperParser, normalizeArxivId } from './paper-parser.js';
 import { RepoFetcher } from './repo-fetcher.js';
 import { buildReport } from './reporter.js';
-import type { AlignmentReport } from './types.js';
+import type { AlignmentReport, CodeFunction, ParsedPaper, RepoFile } from './types.js';
 
 export interface PaperAlignAgentOptions {
     llm?: LLMClient;
     githubToken?: string;
-    /** 函数级抽取的最大候选函数数（喂 LLM 之前） */
+    proxyUrl?: string;
     keyFunctionCount?: number;
-    /** 候选文件数（喂 key-function-selector 之前） */
     candidateFileCount?: number;
-    /** 进度回调 */
     onProgress?: (stage: string, info?: string) => void;
+    cacheTtlMs?: number;
+}
+
+interface CacheEntry<T> {
+    data: T;
+    ts: number;
 }
 
 export class PaperAlignAgent {
     private llm: LLMClient;
     private paperParser: PaperParser;
     private repoFetcher: RepoFetcher;
-    private fnSelector: KeyFunctionSelector;
     private aligner: Aligner;
     private onProgress?: (stage: string, info?: string) => void;
+    private cacheTtlMs: number;
+    private paperCache = new Map<string, CacheEntry<ParsedPaper>>();
+    private repoCache = new Map<string, CacheEntry<{
+        owner: string;
+        repo: string;
+        defaultBranch: string;
+        fileTree: string[];
+        candidateFiles: RepoFile[];
+    }>>();
 
     constructor(options: PaperAlignAgentOptions = {}) {
         this.llm = options.llm || defaultLLMClient();
         this.onProgress = options.onProgress;
+        this.cacheTtlMs = options.cacheTtlMs ?? 30 * 60 * 1000;
 
         this.paperParser = new PaperParser(this.llm);
         this.repoFetcher = new RepoFetcher({
             token: options.githubToken,
-            maxFiles: options.candidateFileCount ?? 12,
-        });
-        this.fnSelector = new KeyFunctionSelector(this.llm, {
-            targetCount: options.keyFunctionCount ?? 10,
+            proxyUrl: options.proxyUrl,
+            maxFiles: options.candidateFileCount ?? 30,
         });
         this.aligner = new Aligner(this.llm);
     }
 
-    /**
-     * 主入口：对齐一篇 arXiv 论文
-     */
+    private extractAllFunctions(candidateFiles: RepoFile[]): CodeFunction[] {
+        const all: CodeFunction[] = [];
+        for (const file of candidateFiles) {
+            if (file.language !== 'python') continue;
+            all.push(...extractPythonFunctions(file));
+        }
+        return all;
+    }
+
+    clearCache(): void {
+        this.paperCache.clear();
+        this.repoCache.clear();
+        this.progress('cache', 'all caches cleared');
+    }
+
+    private cachedOrFetch<T>(cache: Map<string, CacheEntry<T>>, key: string, fetcher: () => Promise<T>): Promise<T> {
+        const entry = cache.get(key);
+        if (entry && Date.now() - entry.ts < this.cacheTtlMs) {
+            this.progress('cache', `cache hit: ${key}`);
+            return Promise.resolve(entry.data);
+        }
+        return fetcher().then(data => {
+            cache.set(key, { data, ts: Date.now() });
+            return data;
+        });
+    }
+
     async align(arxivIdOrUrl: string, explicitRepoUrl?: string): Promise<AlignmentReport> {
         const arxivId = normalizeArxivId(arxivIdOrUrl);
 
-        this.progress('paper', `解析论文 ${arxivId} ...`);
-        const paper = await this.paperParser.parse(arxivId);
-        this.progress('paper', `抽取到 ${paper.claims.length} 个声明`);
+        this.progress('paper', `parsing paper ${arxivId} ...`);
+        const paper = await this.cachedOrFetch(this.paperCache, arxivId, () =>
+            this.paperParser.parse(arxivId)
+        );
+        this.progress('paper', `extracted ${paper.claims.length} claims`);
 
         const repoUrl = explicitRepoUrl || paper.repoUrl;
         if (!repoUrl) {
-            this.progress('repo', '论文中未找到 GitHub 链接，跳过代码对齐');
+            this.progress('repo', 'no GitHub link found in paper, skipping code alignment');
             return buildReport({
                 paper: {
                     arxivId: paper.arxivId,
@@ -70,23 +98,25 @@ export class PaperAlignAgent {
                 rows: paper.claims.map(c => ({
                     claim: c,
                     status: 'missing',
-                    note: '论文中未提供 GitHub 链接',
+                    note: 'no GitHub link in paper',
                     confidence: 1.0,
                 })),
             });
         }
 
-        this.progress('repo', `拉取仓库 ${repoUrl} ...`);
-        const repoInfo = await this.repoFetcher.fetchCandidateFiles(repoUrl);
-        this.progress('repo', `筛选出 ${repoInfo.candidateFiles.length} 个候选文件`);
+        this.progress('repo', `fetching repository ${repoUrl} ...`);
+        const repoInfo = await this.cachedOrFetch(this.repoCache, repoUrl, () =>
+            this.repoFetcher.fetchCandidateFiles(repoUrl)
+        );
+        this.progress('repo', `found ${repoInfo.candidateFiles.length} candidate files`);
 
-        this.progress('functions', '抽取关键函数 ...');
-        const keyFunctions = await this.fnSelector.select(repoInfo.candidateFiles);
-        this.progress('functions', `选中 ${keyFunctions.length} 个关键函数`);
+        this.progress('functions', `extracting all functions from ${repoInfo.candidateFiles.length} files ...`);
+        const allFunctions = this.extractAllFunctions(repoInfo.candidateFiles);
+        this.progress('functions', `extracted ${allFunctions.length} functions total`);
 
-        this.progress('align', '对齐 claim ↔ function ...');
-        const rows = await this.aligner.align(paper.claims, keyFunctions);
-        this.progress('align', `对齐完成：${rows.length} 行`);
+        this.progress('align', 'aligning all claims ↔ all functions (single-pass) ...');
+        const rows = await this.aligner.align(paper.claims, allFunctions, paper.title);
+        this.progress('align', `alignment complete: ${rows.length} rows`);
 
         return buildReport({
             paper: {
@@ -112,7 +142,6 @@ export class PaperAlignAgent {
     }
 }
 
-// 重新导出常用符号
 export { Aligner } from './aligner.js';
 export { KeyFunctionSelector } from './key-function-selector.js';
 export { LLMProviderAdapter } from './llm-adapter.js';
@@ -122,4 +151,3 @@ export { PaperParser, extractRepoUrl, normalizeArxivId } from './paper-parser.js
 export { RepoFetcher } from './repo-fetcher.js';
 export { buildReport } from './reporter.js';
 export type { AlignmentReport, AlignmentRow, CodeFunction, PaperClaim, ParsedPaper, ParsedRepo, RepoFile } from './types.js';
-

@@ -86,7 +86,7 @@ export interface AlignmentRow {
     reasoning?: string;
     /** 代码中匹配到的关键证据片段 */
     evidence?: string;
-    /** 证据所在的具体行号（文件绝对行号），用于精确聚焦 */
+    /** 证据所在的具体行号（文件绝对行号，1-based），由 aligner 从函数体相对行号换算得到 */
     evidenceLine?: number;
 }
 

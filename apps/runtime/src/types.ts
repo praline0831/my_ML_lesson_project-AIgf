@@ -4,6 +4,7 @@
  * 消息类型枚举
  */
 export enum MessageType {
+    System = 'system',
     Human = 'human',
     AI = 'ai',
     Tool = 'tool',

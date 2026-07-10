@@ -1,6 +1,6 @@
 ﻿# 论文-代码对齐助手Agent
 
-> 一个面向研究场景的全栈 AI Agent 系统：论文检索 · 深度研究 · 论文-代码对齐 · 多轮对话 · 长期记忆 · 工具/Skill 扩展 · 虚拟形象 · 语音交互。
+> 一个面向研究场景的全栈 AI Agent 系统：论文检索 · 深度研究 · 论文-代码对齐 · 多轮对话 · RAG 持久化记忆 · 工具/Skill 扩展。
 
 ---
 
@@ -20,11 +20,9 @@
   - [apps/web — Web 前端](#appsweb--web-前端)
   - [apps/desktop — Electron 桌面端](#appsdesktop--electron-桌面端)
 - [核心包](#核心包)
-  - [@agent/memory — 短期/长期记忆 + RAG](#agentmemory--短期长期记忆--rag)
   - [@agent/paper — 论文检索 & 深度研究](#agentpaper--论文检索--深度研究)
   - [@agent/paper-align — 论文-代码对齐](#agentpaper-align--论文-代码对齐)
-  - [@agent/live2d — Live2D 虚拟形象](#agentlive2d--live2d-虚拟形象)
-  - [@agent/tts / @agent/asr — 语音模块](#agenttts--agenasr--语音模块)
+  - [@agent/memory — RAG 持久化记忆 + 论文知识库](#agentmemory--rag-持久化记忆--论文知识库)
 - [Skills 系统](#skills-系统)
 - [Prompt 工程](#prompt-工程)
 - [关键设计模式](#关键设计模式)
@@ -37,11 +35,12 @@
 
 ## 项目概览
 
-Your Agent 是一个**全栈、多模态、可扩展的 AI Agent 平台**，围绕"学术研究"这一核心场景设计：
+Your Agent 是一个**全栈、多 Agent 协作的 AI 系统**，围绕"论文研究 + 代码验证"这一核心场景设计：
 
-- **研究侧**：自动从 arXiv 检索论文、对论文做多轮深度研究、抽取关键声明、验证声明与对应开源实现是否一致
-- **对话侧**：基于 LangGraph 状态图的多轮对话，支持工具调用、Skill 注入、RAG 检索增强、短期/长期记忆
-- **交互侧**：Web 前端（VSCode 风格代码块、Markdown/LaTeX 渲染）+ 桌面端（Live2D 虚拟形象 + 语音）
+- **研究侧**：自动从 arXiv 检索论文、多轮深度研究、抽取关键声明、验证声明与对应开源代码实现是否一致
+- **对话侧**：基于 **LangGraph StateGraph** 的多轮对话——`retrieve → think → (act/invoke_skill → think) → summarize`
+- **RAG 侧**：持久化向量知识库，自动存储论文声明、代码片段、问答结果，支持跨会话检索
+- **交互侧**：Web 前端（代码高亮、Markdown/LaTeX 渲染、知识库面板）
 
 整套系统以 **TypeScript Monorepo (Lerna + npm workspaces)** 组织，模块之间通过 `@agent/*` 命名空间解耦，运行时通过 Express 网关 + SSE 流式响应统一对外暴露能力。
 
@@ -51,8 +50,8 @@ Your Agent 是一个**全栈、多模态、可扩展的 AI Agent 平台**，围�
 
 | 模块 | 能力 |
 |------|------|
-| **多轮对话 Agent** | 基于 LangGraph 状态图（StateGraph）编排；ReAct 风格 tool calling；流式 token 输出 |
-| **RAG 记忆系统** | 短期记忆（ChatMessageHistory）+ 长期记忆（MemoryVectorStore + Ollama Embeddings）|
+| **LangGraph Agent** | StateGraph 状态图编排：`retrieve→think→(act/invoke_skill→think)→summarize`；ReAct tool calling；SSE 流式 |
+| **RAG 持久化记忆** | `PersistentVectorStore`（自实现，JSON 持久化）+ Ollama Embeddings；结构化 metadata（source/type/tags）；自动总结 |
 | **Skills 框架** | Claude 风格的 Skill 注册/激活/指令注入；内置 webSearch / calculator / fileRead |
 | **论文检索** | arXiv API 集成；关键词提取（中英停用词）；多轮 sub-query 生成 |
 | **深度研究** | 多轮迭代检索 → 去重 → 摘要 → 综合；生成结构化研究报告 |
@@ -61,53 +60,56 @@ Your Agent 是一个**全栈、多模态、可扩展的 AI Agent 平台**，围�
 | **Markdown + LaTeX 渲染** | react-markdown + remark-gfm + remark-math + rehype-katex + rehype-highlight |
 | **流式接口** | SSE (Server-Sent Events) 实时返回 token、节点轨迹、错误 |
 | **多 LLM 适配** | OpenAI / Anthropic / Ollama（本地）— 通过 providers.yaml 配置 |
-| **多模态** | Live2D 虚拟形象（pixi-live2d-display）· TTS 文本转语音 · ASR 语音识别 |
 
 ---
 
 ## 系统架构
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                         Web 浏览器                            │
-│  React 18 + Vite + prism-react-renderer + react-markdown     │
-│            ┌─────────────┬─────────────┐                    │
-│            │  PaperApp   │  AlignApp   │                    │
-│            │ (chat/搜索/ │ (论文-代码  │                    │
-│            │  深度研究)  │   对齐)     │                    │
-│            └─────────────┴─────────────┘                    │
-└──────────────────────┬───────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                    Web 浏览器 (React 18 + Vite)                  │
+│  · 论文搜索 / 深度研究 / 论文-代码对齐 / 对话 / 知识库面板       │
+│  · 代码高亮 (prism-react-renderer) · Markdown + LaTeX 渲染       │
+└──────────────────────┬──────────────────────────────────────────┘
                        │ HTTP + SSE
                        ▼
-┌──────────────────────────────────────────────────────────────┐
-│                 apps/gateway (Express + ws)                   │
-│  · /chat, /chat/stream, /papers/*, /align/run, /align/export  │
-│  · 静态文件服务  · 跨域  · 50MB body 限制                      │
-└──────┬───────────────────────────┬────────────────────────────┘
-       │                           │
-       ▼                           ▼
-┌──────────────────┐       ┌──────────────────────────────────┐
-│  apps/runtime    │       │       @agent/paper-align          │
-│  · Agent 基类     │       │  · 论文解析 (PDF → 文本)          │
-│  · LangGraph     │◄──────┤  · GitHub 仓库抓取                 │
-│    StateGraph    │       │  · 关键函数选择 (LLM)              │
-│  · Tool 调度     │       │  · Claim-Function 对齐 (LLM)      │
-│  · SkillsManager │       │  · Markdown 报告生成              │
-│  · OllamaAgent   │       │                                    │
-└──────┬───────────┘       └──────────────────────────────────┘
-       │
-       ├──────────► @agent/memory  (短期 + 长期 + RAG)
-       ├──────────► @agent/paper   (arXiv + deep research)
-       └──────────► @agent/live2d / tts / asr
+┌─────────────────────────────────────────────────────────────────┐
+│                  apps/gateway (Express + ws)                     │
+│  /chat/stream · /papers/* · /align/run · /memory/*               │
+└──────┬────────────────────────────────┬─────────────────────────┘
+       │                                │
+       ▼                                ▼
+┌────────────────────────┐    ┌──────────────────────────────┐
+│  apps/runtime           │    │  @agent/paper-align          │
+│  ┌────────────────────┐ │    │  · 论文解析                  │
+│  │ LangGraph StateGraph│ │    │  · GitHub 抓取              │
+│  │ ┌──────┐           │ │    │  · 单轮对齐                  │
+│  │ │retrieve│ (RAG)   │ │    │  · 注入 Memory              │
+│  │ └──┬───┘           │ │    └──────────────────────────────┘
+│  │    ▼               │ │
+│  │ ┌──────┐           │ │    ┌──────────────────────────────┐
+│  │ │ think│ (LLM)     │ │    │  @agent/memory (持久化 RAG)  │
+│  │ └──┬───┘           │ │    │  · PersistentVectorStore     │
+│  │    ▼ (conditional) │ │    │    (data/memory/vectors.json)│
+│  │ ┌──────┐ ┌──────┐ │ │    │  · Ollama Embeddings         │
+│  │ │ act  │ │invoke│ │ │    │  · 结构化 metadata:           │
+│  │ │(tool)│ │(skill)│ │ │    │    source/type/tags/title    │
+│  │ └──┬───┘ └──┬────┘ │ │    │  · 自动保存每轮对话          │
+│  │    ▼        ▼      │ │    └──────────────────────────────┘
+│  │  ┌──────────┐      │ │
+│  │  │ summarize│ (每5轮)│ │    ┌──────────────────────────────┐
+│  │  └──────────┘      │ │    │  @agent/paper                │
+│  └────────────────────┘ │    │  · ArXiv 检索                │
+└────────────────────────┘    │  · 多轮深度研究               │
+                              └──────────────────────────────┘
                        │
                        ▼
-              ┌────────────────────┐
-              │   Ollama (本地)    │
-              │   11434 端口        │
-              │   · kimi-k2.5:cloud│
-              │   · shaw/dmeta-... │
-              │   · gemma4:31b...  │
-              └────────────────────┘
+              ┌──────────────────────┐
+              │  Ollama (localhost)   │
+              │  · 大模型推理          │
+              │  · Embeddings 服务     │
+              │  · dmeta-embedding-zh│
+              └──────────────────────┘
 ```
 
 ---
@@ -146,8 +148,7 @@ Your Agent 是一个**全栈、多模态、可扩展的 AI Agent 平台**，围�
 
 | 技术 | 用途 |
 |------|------|
-| **MemoryVectorStore** (`langchain/vectorstores/memory`) | 内存向量数据库 |
-| **ChatMessageHistory** (`langchain/stores/message/in_memory`) | 对话历史 |
+| **PersistentVectorStore**（自实现）| 余弦相似度搜索 + JSON 文件持久化 (`data/memory/vectors.json`) |
 | **Ollama Embeddings** | 通过 HTTP 调用本地 `shaw/dmeta-embedding-zh` 模型生成向量 |
 | **uuid 11** | 文档 ID 生成 |
 
@@ -158,14 +159,13 @@ Your Agent 是一个**全栈、多模态、可扩展的 AI Agent 平台**，围�
 | **SSE (Server-Sent Events)** | 单向流式推送 token / 节点轨迹 / 错误 |
 | **WebSocket** (`ws`) | 双向通信（echo 服务）|
 
-### 多模态（暂未实现）
+### 知识库面板
 
 | 技术 | 用途 |
 |------|------|
-| **Live2D Cubism Core** | 虚拟形象骨骼动画 |
-| **pixi-live2d-display-advanced 1.1** | Live2D 渲染器（基于 PixiJS）|
-| **PixiJS 7.4 + @pixi/display** | WebGL 渲染引擎 |
-| **TTS / ASR 模块** | 文本转语音 / 语音识别（自定义实现）|
+| **RAG Memory** | `PersistentVectorStore` 自实现向量存储 + Ollama Embeddings (dmeta-embedding-zh) |
+| **结构化 metadata** | 每条知识带 `source`(paper/chat/alignment) / `type`(claim/code/qa/summary) / `tags` / `title` |
+| **类型化接口** | `addPaperClaim()` / `addCodeFunction()` / `addQa()` / `addSummary()` |
 
 ---
 ## 环境依赖与安装
@@ -361,6 +361,9 @@ Express + WebSocket 服务器，统一对外暴露 runtime / paper / paper-align
 | POST | `/papers/export` | 导出 Markdown |
 | POST | `/align/run` | 论文-代码对齐（SSE 流式）|
 | POST | `/align/export` | 导出对齐报告 |
+| GET | `/memory/stats` | 知识库统计（总数 / 按来源 / 按类型） |
+| POST | `/memory/search` | 知识库语义检索 `{ query, k }` |
+| GET | `/memory/recent` | 最近 50 条知识条目 |
 | WS | `/ws` | WebSocket echo |
 
 **SSE 事件格式**：
@@ -376,27 +379,57 @@ data: {"type":"error","error":"..."}\n\n
 
 Agent 的核心实现，基于 **LangGraph 状态图**。
 
-**GraphState 定义**：
+**GraphState 定义**（展示 LangGraph `Annotation.Root` + 自定义 reducer）：
 
 ```typescript
 const GraphState = Annotation.Root({
-  messages: Annotation<BaseMessage[]>({...}),  // 对话历史
-  steps: Annotation<number>({...}),             // 已执行步数
-  finalOutput: Annotation<string>({...}),       // 最终输出
-  trace: Annotation<string[]>({...}),           // 节点执行轨迹
+  messages: Annotation<BaseMessage[]>({
+    reducer: (x, y) => x.concat(y),   // 追加而非覆盖
+    default: () => [],
+  }),
+  steps: Annotation<number>({
+    reducer: (x, y) => x + y,          // 累加
+    default: () => 0,
+  }),
+  finalOutput: Annotation<string>({
+    reducer: (_x, y) => y,             // 覆盖
+    default: () => '',
+  }),
+  trace: Annotation<string[]>({
+    reducer: (x, y) => x.concat(y),   // 追加轨迹
+    default: () => [],
+  }),
+  turnCount: Annotation<number>({
+    reducer: (_x, y) => y,             // 覆盖（外部维护）
+    default: () => 0,
+  }),
 });
 ```
 
 **Agent 类层次**：
 
-- `Agent`（基类）— 定义 ReAct 循环、tool 调用、LangGraph 编译
+- `Agent`（基类）— 定义 LangGraph StateGraph、tool 注册、自动总结
 - `OllamaAgent` — Ollama 适配（错误处理 + Ollama 风格 tool call 解析）
+
+**执行流程**（展示 LangGraph 有向图）：
+
+```
+START → [retrieve] (RAG 查询)
+         → [think] (LLM 推理)
+              → [act] (执行 <tool>) → [think] (循环)
+              → [invoke_skill] (执行 <skill>) → [think] (循环)
+              → [summarize] (每 5 轮对话自动总结 → 写入长期记忆)
+              → END
+```
+
+每一条边都是显式定义的 `addEdge` / `addConditionalEdges`。
 
 **关键能力**：
 
-- 工具调度：LLM 输出 `<tool>{"action":"tool_call","action_input":{"name":"...","args":{...}}}</tool>` → 注册表查找 → 执行
-- Skills 注入：调用 `SkillsManager.buildSystemPrompt()` 把激活 skill 的 instructions 拼接到 system prompt
-- 记忆：可选挂载 `RAGMemoryService`（短期 + 长期 + RAG）
+- 工具调度：LLM 输出 `<tool>{"name":"...","args":{...}}</tool>` → 注册表查找 → 执行
+- Skills 注入：通过 `SkillsManager.buildSystemPrompt()` 把激活 skill 的 instructions 拼接到 system prompt
+- RAG 记忆：`retrieve` 节点在每次 think 前自动检索长期记忆并注入上下文
+- 自动总结：`summarize` 节点每 5 轮自动调用 LLM 总结对话要点，存入向量知识库
 - 流式：通过 `StreamCallbacks { onToken, onNode, onTrace }` 实时反馈
 - LLM 复用：`OllamaAgent.getLLMProvider()` 暴露底层 provider，供 paper-align 等其他 agent 共用同一实例
 
@@ -411,45 +444,45 @@ React 18 + Vite 单页应用。根组件 `App` 嵌入 `PaperApp`，PaperApp 内�
 
 ### apps/desktop — Electron 桌面端
 
-Electron 应用，复用 web 端代码，集成 Live2D 虚拟形象 + TTS/ASR。
+Electron 应用，复用 web 端代码。（占位，未实现）
 
 ---
 
 ## 核心包
 
-### @agent/memory — 短期/长期记忆 + RAG
+### @agent/memory — RAG 持久化记忆 + 论文知识库
 
 **3 个核心类**：
 
 | 类 | 职责 |
 |----|------|
-| `ShortTermMemory` | 包装 LangChain `ChatMessageHistory`；维护当前会话消息流 |
-| `LongTermMemory` | 基于 `LocalVectorStore`；支持 `addFact(key, value)` 和 `addEvent(desc)`；提供 `search(query, k)` 和 `getRetriever()` |
-| `RAGMemoryService` | 组合短期 + 长期；`addTurn(user, ai, facts?)` 同步写两侧 |
-| `MemoryService` | 旧版简化实现（仅向量）|
+| `PersistentVectorStore` | 自实现向量存储；`add()` / `addBatch()` / `search()` / `cosineSimilarity()`；JSON 序列化到磁盘 |
+| `LongTermMemory` | 类型化知识接口：`addPaperClaim()` / `addCodeFunction()` / `addAlignmentResult()` / `addQa()` / `addSummary()` |
+| `RAGMemoryService` | 统一入口；懒初始化 + 自动保存；`addTurn(user, ai)` 写入 QA + 持久化 |
 
-**嵌入模型**：
+**持久化**：
+```
+data/memory/vectors.json  ← 每次 addTurn() / addBatch() 自动写入
+```
+重启时 `initialize()` 读取 JSON 重建向量索引，完全不丢失。
+
+**元数据结构**：
 
 ```typescript
-// 通过 Ollama HTTP API 调用本地嵌入模型
-const res = await fetch("http://localhost:11434/api/embeddings", {
-  method: "POST",
-  body: JSON.stringify({
-    model: "shaw/dmeta-embedding-zh:latest",
-    prompt: text,
-  }),
-});
+{
+  source: 'paper' | 'chat' | 'alignment' | 'summary',  // 来源
+  type: 'claim' | 'code' | 'qa' | 'function' | 'summary',  // 内容类型
+  title?: string,    // 标题（如论文名）
+  tags?: string[],   // 关键词标签
+  importance?: 1|2|3,
+  timestamp: number,
+}
 ```
 
-**RAG 检索流程**：
-
-```
-用户 query
-  → Ollama embed (本地 HTTP)
-  → MemoryVectorStore._queryVectors (cosine similarity)
-  → top-k 文档
-  → 注入 LLM system prompt 作为上下文
-```
+**检索方式**：
+- `search(query, k)` — 全局语义搜索
+- `searchBySource(source, query, k)` — 按来源过滤
+- `searchByType(type, query, k)` — 按类型过滤
 
 ### @agent/paper — 论文检索 & 深度研究
 
@@ -536,13 +569,27 @@ interface AlignmentRow {
 }
 ```
 
-### @agent/live2d — Live2D 虚拟形象
+### @agent/memory — RAG 持久化记忆 + 论文知识库
 
-基于 `pixi-live2d-display-advanced` 的渲染封装。配合 desktop 端使用。
+持久化向量记忆系统。对话中的论文声明、代码片段、问答自动存入向量数据库，
+下次检索可自动召回相关上下文。基于 **自实现 PersistentVectorStore + Ollama 本地 embedding**。
 
-### @agent/tts / @agent/asr — 语音模块
+**核心特性**：
+- **自动持久化**：`PersistentVectorStore` 序列化到 `data/memory/vectors.json`，服务重启不丢失
+- **结构化存储**：每条记忆带 `source`（paper/chat/alignment）、`type`（claim/code/qa/summary/fact）、`tags`、`title` 等 metadata
+- **按来源/类型检索**：`searchBySource('paper', query)`、`searchByType('claim', query)`
+- **自动总结**：LangGraph `summarize` node 每 5 轮对话自动调用 LLM 总结并存入 long-term memory
+- **对齐注入**：`/align/run` 完成后自动将 claims + matched code 写入向量库
+- **前端知识库面板**：在 Web UI 查看统计、搜索、浏览最近条目
 
-文本转语音 / 语音识别。stub 包，预留接口。
+**文件：`packages/memory/src/`**
+
+| 文件 | 职责 |
+|---|---|
+| `vector-store.ts` | `PersistentVectorStore` — 自实现向量存储，余弦相似度搜索，JSON 持久化 |
+| `long-term-memory.ts` | `LongTermMemory` — 结构化知识条目，`addPaperClaim()` / `addCodeFunction()` / `addQa()` 等类型化接口 |
+| `memory-service.ts` | `RAGMemoryService` — 统一入口，自动初始化 + 自动保存 |
+| `short-term-memory.ts` | `ShortTermMemory` — ChatMessageHistory 包装（保留兼容）|
 
 ---
 
@@ -791,7 +838,7 @@ npm run build
 ## 路线图
 
 - [ ] **多模态对齐**：把论文图表/公式（image）也纳入 claim 抽取
-- [ ] **ASR/TTS 完整接入**：桌面端支持语音输入/输出
+- [ ] **跨会话记忆增强**：支持时间衰减、自动过期、手动编辑知识条目
 - [ ] **Skills 市场**：UI 上可视化注册/启用 skill
 - [ ] **Prompt 版本管理**：把 prompt 模板化到独立文件，git 追踪
 - [ ] **评估基准**：内置论文-代码对齐的评估脚本（precision/recall）

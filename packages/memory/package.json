@@ -6,10 +6,9 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "test:short": "node --loader tsx src/test-short-term.ts",
     "test:long": "node --loader tsx src/test-long-term.ts",
     "test:rag": "node --loader tsx src/test-rag-memory.ts",
-    "test": "node --loader tsx src/test-short-term.ts && node --loader tsx src/test-long-term.ts && node --loader tsx src/test-rag-memory.ts"
+    "test": "node --loader tsx src/test.ts"
   },
   "dependencies": {
     "@langchain/core": "^0.3.27",

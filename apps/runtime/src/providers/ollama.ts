@@ -4,10 +4,12 @@ import { Message, MessageType } from '../types.js';
 export class OllamaClient extends BaseLLMClient {
     protected async doGenerate(messages: Message[]): Promise<string> {
         try {
-            const messagesPayload = messages.map((msg) => ({
-                role: msg.type === MessageType.Human ? 'user' : 'assistant',
-                content: msg.content,
-            }));
+            const messagesPayload = messages.map((msg) => {
+                let role = 'assistant';
+                if (msg.type === MessageType.System) role = 'system';
+                else if (msg.type === MessageType.Human) role = 'user';
+                return { role, content: msg.content };
+            });
 
             const response = await fetch(`${this.config.endpoint}/api/chat`, {
                 method: 'POST',
@@ -43,10 +45,12 @@ export class OllamaClient extends BaseLLMClient {
 
     protected async *doGenerateStream(messages: Message[]): AsyncIterable<string> {
         try {
-            const messagesPayload = messages.map((msg) => ({
-                role: msg.type === MessageType.Human ? 'user' : 'assistant',
-                content: msg.content,
-            }));
+            const messagesPayload = messages.map((msg) => {
+                let role = 'assistant';
+                if (msg.type === MessageType.System) role = 'system';
+                else if (msg.type === MessageType.Human) role = 'user';
+                return { role, content: msg.content };
+            });
 
             const response = await fetch(`${this.config.endpoint}/api/chat`, {
                 method: 'POST',

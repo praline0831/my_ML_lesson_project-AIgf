@@ -11,7 +11,8 @@
     "build": "tsc"
   },
   "dependencies": {
-    "@agent/paper": "*"
+    "@agent/paper": "*",
+    "undici": "^6.21.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

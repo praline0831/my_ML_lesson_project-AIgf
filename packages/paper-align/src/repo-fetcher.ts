@@ -1,27 +1,14 @@
-/**
- * GitHub 仓库抓取器
- *
- * 策略：
- *   1. 解析 owner/repo + 默认分支
- *   2. 用 Git Trees API 拉完整文件树（递归）
- *   3. 启发式过滤 + 让 LLM 选"关键文件"
- *   4. 用 raw.githubusercontent.com 拉文件原文
- *
- * 注：未鉴权也能用，但有 60 req/h 限制。生产可加 GITHUB_TOKEN。
- */
-
+import { ProxyAgent } from 'undici';
 import type { RepoFile } from './types.js';
 
 const RAW_BASE = 'https://raw.githubusercontent.com';
 const API_BASE = 'https://api.github.com';
 
 export interface RepoFetcherOptions {
-    /** 拉取单个文件的最大字符数（默认 20000） */
     maxFileChars?: number;
-    /** 最多拉取多少个候选文件（默认 12） */
     maxFiles?: number;
-    /** GitHub Token（可选） */
     token?: string;
+    proxyUrl?: string;
 }
 
 interface GitTreeItem {
@@ -42,9 +29,11 @@ interface GitTreeResponse {
 
 export class RepoFetcher {
     private headers: Record<string, string>;
+    private proxyAgent: ProxyAgent | undefined;
+    private proxyUrl: string | undefined;
 
     constructor(private options: RepoFetcherOptions = {}) {
-        this.options = { maxFileChars: 20000, maxFiles: 12, ...options };
+        this.options = { maxFileChars: 30000, maxFiles: 30, ...options };
         this.headers = {
             Accept: 'application/vnd.github+json',
             'User-Agent': 'paper-align-agent/0.1',
@@ -52,12 +41,17 @@ export class RepoFetcher {
         if (options.token) {
             this.headers.Authorization = `Bearer ${options.token}`;
         }
+
+        this.proxyUrl = options.proxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+        this.proxyAgent = this.proxyUrl ? new ProxyAgent(this.proxyUrl) : undefined;
+
+        if (this.proxyAgent) {
+            console.log(`[repo-fetcher] using proxy: ${this.proxyUrl}`);
+        } else {
+            console.warn(`[repo-fetcher] no proxy configured, direct GitHub access may be slow`);
+        }
     }
 
-    /**
-     * 主入口：拉仓库 + 候选文件
-     * 注意：函数级提取不在这里做，由 key-function-selector 处理
-     */
     async fetchCandidateFiles(repoUrl: string): Promise<{
         owner: string;
         repo: string;
@@ -82,7 +76,7 @@ export class RepoFetcher {
                     content: truncate(content, this.options.maxFileChars!),
                 });
             } catch (err) {
-                console.warn(`[repo-fetcher] 跳过 ${path}: ${(err as Error).message}`);
+                console.warn(`[repo-fetcher] skipping ${path}: ${(err as Error).message}`);
             }
         }
 
@@ -96,9 +90,12 @@ export class RepoFetcher {
     }
 
     private async getDefaultBranch(owner: string, repo: string): Promise<string> {
-        const resp = await fetch(`${API_BASE}/repos/${owner}/${repo}`, { headers: this.headers });
+        const resp = await fetch(`${API_BASE}/repos/${owner}/${repo}`, {
+            headers: this.headers,
+            dispatcher: this.proxyAgent,
+        } as RequestInit & { dispatcher?: ProxyAgent });
         if (!resp.ok) {
-            throw new Error(`无法访问仓库 ${owner}/${repo}: ${resp.status}`);
+            throw new Error(`cannot access repo ${owner}/${repo}: ${resp.status}`);
         }
         const data = await resp.json() as { default_branch?: string };
         return data.default_branch || 'main';
@@ -107,49 +104,54 @@ export class RepoFetcher {
     private async getTree(owner: string, repo: string, branch: string): Promise<GitTreeItem[]> {
         const resp = await fetch(
             `${API_BASE}/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`,
-            { headers: this.headers }
+            {
+                headers: this.headers,
+                dispatcher: this.proxyAgent,
+            } as RequestInit & { dispatcher?: ProxyAgent }
         );
         if (!resp.ok) {
-            throw new Error(`无法获取文件树: ${resp.status}`);
+            throw new Error(`cannot fetch file tree: ${resp.status}`);
         }
         const data = await resp.json() as GitTreeResponse;
         if (data.truncated) {
-            console.warn(`[repo-fetcher] 警告：文件树被截断，仅展示前 ~100k 条`);
+            console.warn(`[repo-fetcher] file tree truncated, showing ~100k entries`);
         }
         return data.tree.filter(t => t.type === 'blob');
     }
 
     private async fetchRaw(owner: string, repo: string, branch: string, path: string): Promise<string> {
         const url = `${RAW_BASE}/${owner}/${repo}/${branch}/${path}`;
-        const resp = await fetch(url, {
-            headers: { 'User-Agent': 'paper-align-agent/0.1' },
-        });
-        if (!resp.ok) {
-            throw new Error(`拉取失败: ${resp.status}`);
+        try {
+            const resp = await fetch(url, {
+                headers: { 'User-Agent': 'paper-align-agent/0.1' },
+                dispatcher: this.proxyAgent,
+            } as RequestInit & { dispatcher?: ProxyAgent });
+            if (!resp.ok) {
+                const statusText = resp.statusText || 'Unknown';
+                throw new Error(`fetch failed: ${resp.status} ${statusText} - ${url}`);
+            }
+            return await resp.text();
+        } catch (err) {
+            if (err instanceof Error) {
+                if (err.message.includes('fetch failed')) {
+                    throw err;
+                }
+                throw new Error(`network error: ${err.message} - ${url}`);
+            }
+            throw err;
         }
-        return await resp.text();
     }
 }
 
-/**
- * 解析 owner/repo
- * 支持：https://github.com/owner/repo  /  https://github.com/owner/repo.git
- * 修复：贪心正则会吃末尾标点（.,;:!?'"），需要剥掉再解析
- */
 export function parseRepoUrl(url: string): { owner: string; repo: string } {
-    // 先剥掉末尾的句末标点，避免 microsoft/LoRA. 这种情况
     const cleaned = url.trim().replace(/[.,;:!?'")\]}>]+$/, '');
     const match = cleaned.match(/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)/);
     if (!match) {
-        throw new Error(`无法解析 GitHub URL: ${url}`);
+        throw new Error(`cannot parse GitHub URL: ${url}`);
     }
     return { owner: match[1], repo: match[2].replace(/\.git$/, '') };
 }
 
-/**
- * 过滤出"代码相关"文件
- * 策略：白名单后缀 + 排除常见无关目录
- */
 function filterCodeFiles(paths: string[]): string[] {
     const codeExts = ['.py', '.ipynb'];
     const skipDirs = [
@@ -168,43 +170,57 @@ function filterCodeFiles(paths: string[]): string[] {
     });
 }
 
-/**
- * 给文件排序：入口/核心文件靠前
- * 评分：
- *   + 路径短 → 顶层优先
- *   + 名字匹配核心关键词（model/loss/train/net/dataset/...）
- *   + README 中常被引用的（main.py / train.py / run.py）
- */
 function rankFiles(paths: string[], tree: GitTreeItem[]): string[] {
     const sizeMap = new Map(tree.map(t => [t.path, t.size ?? 0]));
 
     const keywords = [
-        'model', 'models', 'net', 'network', 'arch',
-        'loss', 'criterion', 'objective',
-        'train', 'training', 'trainer',
-        'solver', 'optimizer', 'optim',
-        'dataset', 'data', 'loader',
+        'model', 'models', 'net', 'network', 'arch', 'architecture',
+        'loss', 'criterion', 'objective', 'cost',
+        'train', 'training', 'trainer', 'train_step', 'learn',
+        'solver', 'optimizer', 'optim', 'optimization',
+        'dataset', 'data', 'loader', 'dataloader', 'datasets',
         'main', 'run', 'script',
+        'layer', 'block', 'module', 'component',
+        'attention', 'transformer', 'encoder', 'decoder',
+        'config', 'configuration', 'hparams', 'hyper',
+        'utils', 'util', 'helper', 'tools',
+        'infer', 'inference', 'predict', 'eval', 'evaluate',
+        'engine', 'core', 'nn', 'networks',
+    ];
+
+    const skipPaths = [
+        'test_', '_test', 'tests/', 'testing/',
+        'setup.py', 'setup.cfg', 'requirements',
+        'conf.py', 'Makefile', 'Dockerfile',
+        'README', 'LICENSE', '.gitignore',
     ];
 
     const scored = paths.map(p => {
         let score = 0;
-        const depth = p.split('/').length;
-        score -= depth; // 越浅越优先
+        const parts = p.split('/');
+        const depth = parts.length;
+        const fileName = parts.pop() || '';
+        const dir = parts.join('/');
+
+        score -= depth * 0.5;
 
         const lower = p.toLowerCase();
         for (const kw of keywords) {
             if (lower.includes(kw)) score += 3;
         }
 
-        const fileName = p.split('/').pop() || '';
-        if (/^(main|train|run)\.py$/.test(fileName)) score += 5;
+        if (/^(model|train|main|run|loss|net|config)\.py$/.test(fileName)) score += 8;
+        if (/^__init__\.py$/.test(fileName)) score += 2;
+        if (skipPaths.some(s => lower.includes(s))) score -= 10;
 
-        // 文件大小惩罚：太大不好读
+        if (/\bsrc\b/.test(dir)) score += 3;
+        if (/\b(lib|core|nn|networks)\b/.test(dir)) score += 3;
+
         const size = sizeMap.get(p) ?? 0;
-        if (size > 50000) score -= 2;
-        if (size > 100000) score -= 5;
-        if (size < 1000) score -= 1;
+        if (size > 80000) score -= 3;
+        if (size > 150000) score -= 6;
+        if (size < 500) score -= 1;
+        if (size >= 1000 && size <= 30000) score += 2;
 
         return { p, score };
     });

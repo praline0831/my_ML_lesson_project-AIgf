@@ -1,35 +1,26 @@
-/**
- * 关键函数选择器
- *
- * 流程：
- *   1. 用正则从 Python 文件中粗提取所有 top-level def / class
- *   2. 按"启发式分数"排序（类名/函数名/代码长度）
- *   3. 取 top-N 让 LLM 二轮挑出"真正对应论文核心方法的"函数
- *
- * 设计取舍：不做完整 AST（依赖太重），但能覆盖 80% ML repo 的关键函数。
- */
-
 import { LLMClient } from './llm-client.js';
 import type { CodeFunction, RepoFile } from './types.js';
 
 export interface KeyFunctionSelectorOptions {
-    /** 最终选几个关键函数（默认 10） */
     targetCount?: number;
-    /** 每个函数提取的最大字符数（默认 3000） */
     maxBodyChars?: number;
     llm?: LLMClient;
 }
 
 const KEYWORD_HINTS = [
     'model', 'net', 'network', 'arch', 'forward',
+    '__init__', 'setup', 'configure',
     'loss', 'criterion', 'objective',
     'train', 'step', 'update',
     'optim', 'lr', 'schedule',
     'attention', 'mha', 'mlp',
-    'embed', 'encoder', 'decoder',
-    'lora', 'adapter', 'prefix',
+    'embed', 'embedding', 'encoder', 'decoder',
+    'lora', 'adapter', 'prefix', 'prompt',
     'sample', 'generate', 'decode',
     'compute', 'calculate',
+    'transform', 'norm', 'normalize',
+    'dropout', 'activation', 'relu', 'gelu',
+    'init', 'parameter', 'weight',
 ];
 
 export class KeyFunctionSelector {
@@ -37,11 +28,12 @@ export class KeyFunctionSelector {
 
     constructor(llm: LLMClient, private options: KeyFunctionSelectorOptions = {}) {
         this.llm = llm;
-        this.options = { targetCount: 10, maxBodyChars: 3000, ...options };
+        this.options = { targetCount: 15, maxBodyChars: 5000, ...options };
     }
 
-    async select(candidateFiles: RepoFile[]): Promise<CodeFunction[]> {
-        // 1) 粗提取
+    async select(candidateFiles: RepoFile[], paperTitle?: string, paperAbstract?: string): Promise<CodeFunction[]> {
+        this.paperTitle = paperTitle;
+        this.paperAbstract = paperAbstract;
         const all: CodeFunction[] = [];
         for (const file of candidateFiles) {
             if (file.language !== 'python') continue;
@@ -50,74 +42,84 @@ export class KeyFunctionSelector {
 
         if (all.length === 0) return [];
 
-        // 2) 启发式排序，取候选池（多给点让 LLM 有空间挑）
-        const ranked = rankByHeuristic(all);
-        const poolSize = Math.min(ranked.length, this.options.targetCount! * 3);
+        const ranked = rankByHeuristic(all, paperTitle, paperAbstract);
+        const poolSize = Math.min(ranked.length, Math.max(this.options.targetCount! * 8, 80));
         const pool = ranked.slice(0, poolSize);
 
-        // 3) LLM 二轮挑
         const picked = await this.llmPick(pool);
 
         return picked;
     }
 
+    private paperTitle?: string;
+    private paperAbstract?: string;
+
     private async llmPick(pool: CodeFunction[]): Promise<CodeFunction[]> {
         const target = this.options.targetCount!;
         const summaries = pool.map((f, i) => {
-            const body = f.body.length > 600 ? f.body.slice(0, 600) + '...' : f.body;
+            const MAX = 1200;
+            const body = f.body.length > MAX
+                ? f.body.slice(0, Math.floor(MAX * 0.7)) + '\n# ... (truncated, middle omitted) ...\n' + f.body.slice(-Math.floor(MAX * 0.3))
+                : f.body;
             return `[${i}] ${f.file} :: ${f.name} (L${f.startLine}-${f.endLine})\n${f.signature}\n${body}`;
         }).join('\n\n---\n\n');
 
-        const systemPrompt = `你是 ML 代码审查专家。任务：从候选函数池中挑出 ${target} 个最可能是"论文核心方法实现"的函数/类。
+        const paperContext = this.paperTitle
+            ? `## Paper title\n${this.paperTitle}\n\n## Paper abstract\n${(this.paperAbstract || '(unavailable)').slice(0, 2000)}`
+            : '(no paper context available — use function names and body heuristics)';
 
-## 三档优先级（按顺序挑）
+        const systemPrompt = `You are an ML code review expert. Select the **${target} most critical functions/classes** that implement the paper's method from the candidate pool.
 
-### P0 - 必选（核心方法）
-- 论文方法名直接对应的类/函数（LoRA → \`LoRALayer\`, Transformer → \`MultiHeadAttention\`）
-- 方法的 forward / compute / __call__ 入口
-- 训练主循环（\`train_step\`, \`fit\`, \`update\`）
+## Paper context
+${paperContext}
 
-### P1 - 优先选（关键计算）
-- 核心数学公式的实现（attention score、loss、sample）
-- 关键 trick（gradient checkpoint、RoPE、LayerNorm、激活函数）
-- 数据加载/预处理主入口
+## Priority tiers (select in order)
 
-### P2 - 选剩余名额时考虑
-- 配置/超参数类（仅当其包含可对齐的 claim 时）
-- 评估函数（如果 claim 涉及）
+### P0 - Must select (core method)
+- Class/function directly implementing the paper's named method or contribution
+- Method entry points: forward / compute / __call__ / __init__
+- Training loop and loss computation
 
-## ❌ 必跳过的"噪音函数"
-- 工具函数：\`parse_args\`, \`save_checkpoint\`, \`load_model\`, \`set_seed\`, \`to_tensor\`, \`print_metrics\`
-- 入口/CLI：\`main\`, \`run\`, \`cli\`, \`parse_args\`
-- 日志/可视化：\`log\`, \`plot\`, \`wandb_init\`, \`tensorboard\`
-- 注册器：\`register_model\`, \`register_dataset\`
-- 测试/demo：名字含 \`test_\` / \`demo\` / \`example\` / \`_demo\`
-- 装饰器/包装器：单纯包一层没新逻辑的
+### P1 - Prefer (key computation)
+- Core math formula implementations matching paper equations
+- Key building blocks (attention, normalization, activation, embeddings)
+- Data preprocessing / augmentation that matches paper description
 
-## 评判步骤
-对每个候选函数，回答三个问题：
-1. 函数名是否暗示核心组件？（model/loss/attention/...）
-2. 函数体里是否有关键计算（不是工具函数）？
-3. docstring 或代码注释是否提到算法细节？
+### P2 - Fill remaining slots
+- Config/hyperparameter classes (if they contain paper-specific values)
+- Evaluation metrics that paper claims
 
-只挑三项都"是"的。
+## Functions to SKIP (noise)
+- Utilities: parse_args, save_checkpoint, load_model, set_seed, to_tensor, print_metrics, mkdir
+- CLI wrappers: main, run, cli, parse_args (unless they contain core logic)
+- Logging: log, plot, wandb_init, tensorboard, logger
+- Registries: register_model, register_dataset
+- Test files: names containing test_ / demo / example / _demo / mock
+- Pure wrappers with no new logic
 
-## 输出格式（严格 JSON）
+## Selection criteria
+1. Does the function/class name or body suggest it implements a paper-specific component?
+2. Does the body contain non-trivial computations matching the paper description?
+3. Would removing this function break the paper's core method?
+
+Select only if YES to at least two of three.
+
+## Output format (strict JSON)
 {
   "selected": [
     {
-      "index": 0,                            // 候选池下标
+      "index": 0,
       "priority": "P0"|"P1"|"P2",
-      "reason": "为什么选它（<= 30 字）"
+      "reason": "Why this matches the paper (<= 40 chars)"
     }
   ]
 }`;
 
-        const userPrompt = `候选函数池（共 ${pool.length} 个）：
+        const userPrompt = `Candidate function pool (${pool.length} total):
 
 ${summaries}
 
-请挑选最关键的 ${target} 个。`;
+Select the ${target} most critical functions for this paper.`;
 
         interface PickItem {
             index: number;
@@ -130,12 +132,10 @@ ${summaries}
             { role: 'user', content: userPrompt },
         ]);
 
-        // 兼容旧版输出：selected 可能是 number[] 或 {index, priority, reason}[]
         const items = (result.selected || []).map(item =>
             typeof item === 'number' ? { index: item } : item
         );
 
-        // 按 P0 → P1 → P2 排序，再按 pool 顺序填充
         const priorityOrder: Record<string, number> = { P0: 0, P1: 1, P2: 2 };
         items.sort((a, b) => {
             const pa = priorityOrder[a.priority ?? 'P2'] ?? 2;
@@ -151,22 +151,14 @@ ${summaries}
     }
 }
 
-/**
- * 从 Python 文件提取所有 def / class 块
- *
- * 关键：class 内部的 def 会作为独立方法提取（命名：ClassName.method）
- * 这样 LoRALinear.forward 和 LoRALinear.__init__ 分开，
- * 对齐时不会把整个类几十行混在一起。
- */
 export function extractPythonFunctions(file: RepoFile): CodeFunction[] {
     const lines = file.content.split('\n');
     const defRegex = /^(async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\s*[\(:]/;
 
-    // 1) 找出所有 def/class 起始行 + 缩进级别
     type DefSpan = {
-        idx: number;        // defs 数组中的下标
-        line: number;       // 0-based 起始行
-        indent: number;     // 缩进（0 = 顶层）
+        idx: number;
+        line: number;
+        indent: number;
         kind: 'def' | 'class';
         name: string;
     };
@@ -184,7 +176,6 @@ export function extractPythonFunctions(file: RepoFile): CodeFunction[] {
         });
     }
 
-    // 2) 计算每个 def 的"父级"（最近的、缩进更浅的 def/class）
     const parentOf = (i: number): DefSpan | null => {
         for (let j = i - 1; j >= 0; j--) {
             if (defs[j].indent < defs[i].indent) return defs[j];
@@ -192,13 +183,10 @@ export function extractPythonFunctions(file: RepoFile): CodeFunction[] {
         return null;
     };
 
-    // 3) 计算每个 def 的结束行（下一个缩进 ≤ 自己的 def 之前）
-    //    顶层 def 的 body 会包含所有缩进更深的子 def（class 整段）
-    //    方法的 body 不会包含 sibling 方法
     const results: CodeFunction[] = [];
     for (let i = 0; i < defs.length; i++) {
         const def = defs[i];
-        let endLine = lines.length; // 默认到文件末尾
+        let endLine = lines.length;
 
         for (let j = i + 1; j < defs.length; j++) {
             if (defs[j].indent <= def.indent) {
@@ -207,19 +195,17 @@ export function extractPythonFunctions(file: RepoFile): CodeFunction[] {
             }
         }
 
-        // 命名：方法带父级前缀（LoRALinear.forward），顶层 def 不带
         const parent = parentOf(i);
         const fullName = parent ? `${parent.name}.${def.name}` : def.name;
 
-        // 签名：从 def 行往下找第一个以 `):` 结尾的行（参数列表结束）
         const signature = buildSignature(lines, def.line, def.indent);
 
         const body = lines.slice(def.line, endLine).join('\n');
         results.push({
             file: file.path,
             name: fullName,
-            startLine: def.line + 1,    // 1-based, 含
-            endLine,                     // 0-based, 不含
+            startLine: def.line + 1,
+            endLine,
             signature,
             body,
             kind: def.kind,
@@ -230,23 +216,15 @@ export function extractPythonFunctions(file: RepoFile): CodeFunction[] {
     return results;
 }
 
-/**
- * 构建函数签名
- * - 顶层 def: 取 def 行 + 参数列表结束
- * - 短 def（单行签名的）就返回一行
- */
 function buildSignature(lines: string[], startLine: number, indent: number): string {
     const first = lines[startLine].trim();
-    // 如果第一行就有 `):` 或 `):` 配对 → 单行签名
     const openParens = (first.match(/\(/g) || []).length;
     const closeParens = (first.match(/\)/g) || []).length;
     if (openParens > closeParens) {
-        // 多行签名：向后找参数列表结束
         for (let i = startLine + 1; i < Math.min(startLine + 10, lines.length); i++) {
             const line = lines[i];
             const lineIndent = line.length - line.trimStart().length;
-            if (lineIndent > indent) continue; // 还在参数列表里
-            // 找 `):` 或 `):`
+            if (lineIndent > indent) continue;
             if (line.includes('):') || line.includes(') :')) {
                 return lines.slice(startLine, i + 1).join('\n');
             }
@@ -255,18 +233,40 @@ function buildSignature(lines: string[], startLine: number, indent: number): str
     return first;
 }
 
-function rankByHeuristic(functions: CodeFunction[]): CodeFunction[] {
+function rankByHeuristic(functions: CodeFunction[], paperTitle?: string, paperAbstract?: string): CodeFunction[] {
+    const paperTokens = new Set<string>();
+    if (paperTitle || paperAbstract) {
+        const raw = `${paperTitle || ''} ${paperAbstract || ''}`.toLowerCase();
+        for (const t of raw.split(/[\s,;:()\[\]{}=+\-*/\\'"`<>!?|.…、，。；：（）【】"「」『』《》]+/)) {
+            if (t.length >= 3 && !/^\d+$/.test(t)) paperTokens.add(t);
+        }
+    }
+
     const scored = functions.map(f => {
         let score = 0;
         const lower = (f.file + '::' + f.name).toLowerCase();
+        const bodyLower = f.body.toLowerCase();
+
         for (const kw of KEYWORD_HINTS) {
             if (lower.includes(kw)) score += 2;
         }
-        // 长度适中加分
+
+        if (paperTokens.size > 0) {
+            for (const token of paperTokens) {
+                if (lower.includes(token)) score += 4;
+                if (bodyLower.includes(token)) score += 2;
+            }
+        }
+
+        const name = f.name.toLowerCase();
+        if (name === '__init__') score += 6;
+        if (name === 'forward') score += 5;
+
         const len = f.body.length;
-        if (len > 200 && len < 3000) score += 3;
-        if (len > 3000) score += 1;
-        if (len < 100) score -= 2;
+        if (len >= 50 && len < 200) score += 2;
+        if (len >= 200 && len < 3000) score += 3;
+        if (len >= 3000) score += 1;
+
         return { f, score };
     });
     scored.sort((a, b) => b.score - a.score);

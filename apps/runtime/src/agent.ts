@@ -17,6 +17,7 @@ export type ToolRegistry = Record<string, (args: Record<string, unknown>) => Pro
  * - steps: 已执行步数
  * - finalOutput: 最终输出
  * - trace: 每个节点的执行轨迹（用于演示）
+ * - turnCount: 会话轮次计数（用于自动总结）
  */
 const GraphState = Annotation.Root({
   messages: Annotation<BaseMessage[]>({
@@ -34,6 +35,10 @@ const GraphState = Annotation.Root({
   trace: Annotation<string[]>({
     reducer: (x, y) => x.concat(y),
     default: () => [],
+  }),
+  turnCount: Annotation<number>({
+    reducer: (_x, y) => y,
+    default: () => 0,
   }),
 });
 
@@ -65,6 +70,7 @@ export interface StreamCallbacks {
  */
 export abstract class Agent {
   protected messages: Message[] = [];
+  protected turnCount: number = 0;
   protected memory?: RAGMemoryService;
   protected config: AgentConfig;
   protected toolRegistry: ToolRegistry = {};
@@ -116,6 +122,13 @@ export abstract class Agent {
   public deactivateSkill(name: string): void {
     this.skills.deactivate(name);
     this.log(`已停用 Skill: ${name}`);
+  }
+
+  /**
+   * 获取 RAGMemoryService 实例，用于外部注入知识（如对齐结果）
+   */
+  public getMemory(): RAGMemoryService | undefined {
+    return this.memory;
   }
 
   /**
@@ -271,7 +284,36 @@ export abstract class Agent {
         };
       })
 
-      // 4. invoke_skill 节点 - 执行 LLM 在 <skill>...</skill> 中请求的 Skill
+      // 4. summarize 节点 - 每 N 轮自动总结对话并写入长期记忆
+      .addNode('summarize', async (state) => {
+        const turnCount = state.turnCount || 1;
+        if (turnCount % 5 !== 0) {
+          return { trace: ['⏭️ [summarize] 未到总结轮次，跳过'] };
+        }
+        const msgs = state.messages;
+        if (msgs.length < 4) {
+          return { trace: ['⏭️ [summarize] 对话太短，跳过'] };
+        }
+        // 取最近 2 轮对话
+        const recent = msgs.slice(-4).map(m =>
+          `${m instanceof HumanMessage ? 'User' : 'AI'}: ${(m.content?.toString() ?? '').slice(0, 200)}`,
+        ).join('\n');
+        const summaryPrompt = `Briefly summarise the key topics and facts in this conversation snippet (1-2 sentences, in English or Chinese):\n${recent}`;
+        try {
+          const summary = await self.callLLM([
+            { type: MessageType.Human, content: summaryPrompt, timestamp: Date.now() },
+          ]);
+          await self.memory?.longTerm.addSummary('conversation', summary);
+          return {
+            trace: [`📝 [summarize] 自动总结已存储: ${summary.slice(0, 100)}...`],
+            turnCount: turnCount,
+          };
+        } catch {
+          return { trace: ['⚠️ [summarize] 总结生成失败'] };
+        }
+      })
+
+      // 5. invoke_skill 节点 - 执行 LLM 在 <skill>...</skill> 中请求的 Skill
       .addNode('invoke_skill', async (state) => {
         const lastAI = [...state.messages].reverse().find((m) => m instanceof AIMessage);
         const content = lastAI?.content?.toString() ?? '';
@@ -323,15 +365,15 @@ export abstract class Agent {
       .addConditionalEdges('think', (state) => {
         const lastAI = [...state.messages].reverse().find((m) => m instanceof AIMessage);
         const content = lastAI?.content?.toString() ?? '';
-        const exceeded = state.steps >= (self.config.maxSteps ?? 10);
-        if (exceeded) return END;
         // 优先匹配 <skill>，其次 <tool>
         if (self.skills.parseSkillCall(content)) return 'invoke_skill';
         if (self.parseToolCall(content)) return 'act';
-        return END;
+        // 无论正常结束还是超出步数，都走 summarize 做一次清理
+        return 'summarize';
       })
       .addEdge('act', 'think')
-      .addEdge('invoke_skill', 'think');
+      .addEdge('invoke_skill', 'think')
+      .addEdge('summarize', END);
 
     return workflow.compile();
   }
@@ -343,6 +385,7 @@ export abstract class Agent {
     try {
       this.addMessage(MessageType.Human, input);
       if (!this.graph) this.graph = this.buildGraph();
+      this.turnCount = (this.turnCount ?? 0) + 1;
 
       const initialMessages = this.messages.map(toLangChainMessage);
       const finalState = await this.graph.invoke({
@@ -350,6 +393,7 @@ export abstract class Agent {
         steps: 0,
         finalOutput: '',
         trace: [],
+        turnCount: this.turnCount,
       });
 
       const lastAI = [...finalState.messages].reverse().find((m) => m instanceof AIMessage);
@@ -383,9 +427,10 @@ export abstract class Agent {
   public async *runStream(input: string): AsyncGenerator<string | string[], void, unknown> {
     this.addMessage(MessageType.Human, input);
     if (!this.graph) this.graph = this.buildGraph();
+    this.turnCount = (this.turnCount ?? 0) + 1;
 
     const initialMessages = this.messages.map(toLangChainMessage);
-    const initialState = { messages: initialMessages, steps: 0, finalOutput: '', trace: [] };
+    const initialState = { messages: initialMessages, steps: 0, finalOutput: '', trace: [], turnCount: this.turnCount };
 
     // 累积状态
     let accumulated = initialState;
