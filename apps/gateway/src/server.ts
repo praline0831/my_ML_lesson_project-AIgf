@@ -16,6 +16,7 @@ const agent = createAgent({ verbose: false });
 
 for (const tool of paperTools) {
   agent.registerTool(tool.name, tool.execute);
+  agent.addToolDescription(tool.name, tool.description);
 }
 
 /** 健康检查 */
@@ -122,9 +123,12 @@ app.post("/chat/stream", async (req, res) => {
         if (marker === "__DONE__") {
           send({ type: "done", output, id: assistantMsgId });
         }
+      } else if (typeof chunk === "object" && chunk !== null && 'node' in chunk) {
+        // 结构化节点事件
+        send({ type: "node", name: (chunk as any).node, trace: (chunk as any).trace });
       } else if (typeof chunk === "string") {
-        // 节点 trace
-        send({ type: "node", trace: chunk });
+        // 兼容旧格式（纯文本 trace）
+        send({ type: "node", name: "unknown", trace: chunk });
       }
     }
 

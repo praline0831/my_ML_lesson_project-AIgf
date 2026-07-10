@@ -8,6 +8,7 @@ export class OllamaClient extends BaseLLMClient {
                 let role = 'assistant';
                 if (msg.type === MessageType.System) role = 'system';
                 else if (msg.type === MessageType.Human) role = 'user';
+                else if (msg.type === MessageType.ToolResult) role = 'tool';
                 return { role, content: msg.content };
             });
 
@@ -49,6 +50,7 @@ export class OllamaClient extends BaseLLMClient {
                 let role = 'assistant';
                 if (msg.type === MessageType.System) role = 'system';
                 else if (msg.type === MessageType.Human) role = 'user';
+                else if (msg.type === MessageType.ToolResult) role = 'tool';
                 return { role, content: msg.content };
             });
 

@@ -63,6 +63,13 @@ interface AlignmentReport {
     markdown: string;
 }
 
+interface ExecStep {
+    id: number;
+    node: string;
+    trace: string;
+    time: number;
+}
+
 interface Message {
     id: string;
     role: "user" | "assistant";
@@ -115,6 +122,7 @@ export function UnifiedResearchApp() {
     const [chatInput, setChatInput] = useState("");
     const [chatLoading, setChatLoading] = useState(false);
     const [customContext, setCustomContext] = useState("");
+    const [execSteps, setExecSteps] = useState<ExecStep[]>([]);
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
     const scrollToBottom = () => {
@@ -232,6 +240,7 @@ export function UnifiedResearchApp() {
 
         const userMsg: Message = { id: crypto.randomUUID(), role: "user", content: text };
         setMessages((prev) => [...prev, userMsg]);
+        setExecSteps([]);
 
         const assistantId = crypto.randomUUID();
         setMessages((prev) => [...prev, { id: assistantId, role: "assistant", content: "" }]);
@@ -256,6 +265,7 @@ export function UnifiedResearchApp() {
             const decoder = new TextDecoder();
             let buffer = "";
 
+            let stepCounter = 0;
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
@@ -273,6 +283,14 @@ export function UnifiedResearchApp() {
                                 prev.map((m) => m.id === assistantId ? { ...m, content: m.content + payload.content } : m)
                             );
                             setTimeout(scrollToBottom, 0);
+                        } else if (payload.type === "node") {
+                            const step: ExecStep = {
+                                id: stepCounter++,
+                                node: payload.name || "unknown",
+                                trace: payload.trace || "",
+                                time: Date.now(),
+                            };
+                            setExecSteps((prev) => [...prev, step]);
                         } else if (payload.type === "done") {
                             console.log("[Stream done]");
                         } else if (payload.type === "error") {
@@ -660,6 +678,11 @@ export function UnifiedResearchApp() {
                     <div ref={messagesEndRef} />
                 </div>
 
+                {/* 执行轨迹 Timeline */}
+                {execSteps.length > 0 && (
+                    <ExecTimeline steps={execSteps} />
+                )}
+
                 <div style={{ display: "flex", gap: 8 }}>
                     <input
                         value={chatInput}
@@ -814,6 +837,70 @@ function MemoryPanel({ apiBase }: { apiBase: string }) {
                         </div>
                     ))}
                     {items.length === 0 && <p style={{ color: "#999" }}>知识库为空，开始对话或对齐后会自动填充</p>}
+                </div>
+            )}
+        </div>
+    );
+}
+
+// ───────────── 执行轨迹 Timeline ─────────────
+
+const NODE_META: Record<string, { icon: string; label: string; color: string }> = {
+    retrieve: { icon: "🔍", label: "检索", color: "#1a73e8" },
+    think: { icon: "🤖", label: "推理", color: "#9334e6" },
+    act: { icon: "🔧", label: "工具", color: "#e37400" },
+    invoke_skill: { icon: "🎯", label: "Skill", color: "#0d652d" },
+    summarize: { icon: "📝", label: "总结", color: "#5f6368" },
+};
+
+function ExecTimeline({ steps }: { steps: ExecStep[] }) {
+    const [collapsed, setCollapsed] = useState(true);
+    return (
+        <div style={{ margin: "8px 0", background: "#f8f9fa", borderRadius: 8, border: "1px solid #e8eaed" }}>
+            <div
+                onClick={() => setCollapsed(!collapsed)}
+                style={{ padding: "8px 12px", cursor: "pointer", display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "#5f6368", userSelect: "none" }}
+            >
+                <span>{collapsed ? "▶" : "▼"}</span>
+                <span>⚡ Agent 执行轨迹</span>
+                <span style={{ fontSize: 11, color: "#999" }}>{steps.length} 步</span>
+                <span style={{ marginLeft: "auto", display: "flex", gap: 4 }}>
+                    {Array.from(new Set(steps.map(s => s.node))).slice(0, 5).map(n => (
+                        <span key={n} style={{
+                            display: "inline-block", width: 8, height: 8, borderRadius: "50%",
+                            background: NODE_META[n]?.color || "#999",
+                        }} />
+                    ))}
+                </span>
+            </div>
+            {!collapsed && (
+                <div style={{ padding: "0 12px 12px", maxHeight: 300, overflowY: "auto" }}>
+                    {steps.map((step, i) => {
+                        const meta = NODE_META[step.node] || { icon: "⚙️", label: step.node, color: "#999" };
+                        const isLatest = i === steps.length - 1;
+                        return (
+                            <div key={step.id} style={{ display: "flex", gap: 10, padding: "4px 0", alignItems: "flex-start" }}>
+                                {/* 连接线 */}
+                                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", minWidth: 20 }}>
+                                    <div style={{
+                                        width: 20, height: 20, borderRadius: "50%",
+                                        background: isLatest ? meta.color : "#e8eaed",
+                                        display: "flex", alignItems: "center", justifyContent: "center",
+                                        fontSize: 11, color: isLatest ? "#fff" : "#999",
+                                    }}>{meta.icon}</div>
+                                    {i < steps.length - 1 && <div style={{ width: 2, flex: 1, minHeight: 8, background: "#e8eaed" }} />}
+                                </div>
+                                {/* 内容 */}
+                                <div style={{ flex: 1, paddingBottom: i < steps.length - 1 ? 8 : 0 }}>
+                                    <div style={{ fontSize: 12, fontWeight: 600, color: "#333", marginBottom: 2 }}>
+                                        {meta.label}
+                                        <span style={{ fontWeight: 400, color: "#999", marginLeft: 8, fontSize: 11 }}>{step.node}</span>
+                                    </div>
+                                    <div style={{ fontSize: 12, color: "#5f6368", lineHeight: 1.4 }}>{step.trace}</div>
+                                </div>
+                            </div>
+                        );
+                    })}
                 </div>
             )}
         </div>

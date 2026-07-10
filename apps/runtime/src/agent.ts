@@ -74,6 +74,7 @@ export abstract class Agent {
   protected memory?: RAGMemoryService;
   protected config: AgentConfig;
   protected toolRegistry: ToolRegistry = {};
+  protected toolDescriptions: { name: string; description: string }[] = [];
   protected verbose: boolean = false;
   protected llm?: LLMProvider;
   protected graph?: CompiledStateGraph<any, any, any, any>;
@@ -89,10 +90,20 @@ export abstract class Agent {
 
   public registerTool(
     name: string,
-    tool: (args: Record<string, unknown>) => Promise<unknown>
+    tool: ((args: Record<string, unknown>) => Promise<unknown>) | { name: string; description: string; execute: (args: Record<string, unknown>) => Promise<unknown> },
   ): void {
-    this.toolRegistry[name] = tool;
-    this.log(`已注册工具: ${name}`);
+    if (typeof tool === 'object' && tool !== null && 'execute' in tool) {
+      this.toolRegistry[tool.name] = tool.execute;
+      this.toolDescriptions.push({ name: tool.name, description: tool.description });
+      this.log(`已注册工具: ${tool.name}`);
+    } else if (typeof tool === 'function') {
+      this.toolRegistry[name] = tool;
+      this.log(`已注册工具: ${name}`);
+    }
+  }
+
+  public addToolDescription(name: string, description: string): void {
+    this.toolDescriptions.push({ name, description });
   }
 
   public configureLLM(llm: LLMProvider): void {
@@ -174,13 +185,27 @@ export abstract class Agent {
   }
 
   /**
-   * 组合 system prompt：用户配置的 systemPrompt + 已激活 Skill 的 instructions
+   * 组合 system prompt：用户配置 + 已激活 Skill instructions + 注册工具列表
    */
   protected composeSystemPrompt(): string | undefined {
-    const base = this.config.systemPrompt ?? '';
+    const parts: string[] = [];
+    if (this.config.systemPrompt) parts.push(this.config.systemPrompt);
+
+    // 工具列表
+    if (this.toolDescriptions.length > 0) {
+      const lines = this.toolDescriptions.map(
+        (t, i) => `  ${i + 1}. \`${t.name}\`: ${t.description}`,
+      );
+      parts.push(
+        `## Available Tools\nCall a tool by outputting: <tool>{"name":"...","args":{...}}</tool>\n${lines.join('\n')}`,
+      );
+    }
+
+    // Skill instructions
     const skillPrompt = this.skills.buildSystemPrompt();
-    if (base && skillPrompt) return `${base}\n\n${skillPrompt}`;
-    return base || (skillPrompt || undefined);
+    if (skillPrompt) parts.push(skillPrompt);
+
+    return parts.length > 0 ? parts.join('\n\n') : undefined;
   }
 
   /**
@@ -287,7 +312,7 @@ export abstract class Agent {
       // 4. summarize 节点 - 每 N 轮自动总结对话并写入长期记忆
       .addNode('summarize', async (state) => {
         const turnCount = state.turnCount || 1;
-        if (turnCount % 5 !== 0) {
+        if (turnCount % 3 !== 0) {
           return { trace: ['⏭️ [summarize] 未到总结轮次，跳过'] };
         }
         const msgs = state.messages;
@@ -424,7 +449,7 @@ export abstract class Agent {
   /**
    * 【演示】流式执行：边执行边输出 LLM token 和节点轨迹
    */
-  public async *runStream(input: string): AsyncGenerator<string | string[], void, unknown> {
+  public async *runStream(input: string): AsyncGenerator<string | string[] | { node: string; trace: string }, void, unknown> {
     this.addMessage(MessageType.Human, input);
     if (!this.graph) this.graph = this.buildGraph();
     this.turnCount = (this.turnCount ?? 0) + 1;
@@ -440,15 +465,17 @@ export abstract class Agent {
     const streamPromise = this.graph.stream(initialState) as any;
     const stream = await streamPromise;
     for await (const chunk of stream) {
-      // chunk 形如 { nodeName: stateUpdate }
+      // 调试：输出 chunk 结构（稳定后删掉）
+      if (this.verbose) console.error('[stream-chunk] keys:', Object.keys(chunk), 'event:', (chunk as any).event, 'name:', (chunk as any).name);
       for (const [nodeName, nodeState] of Object.entries(chunk)) {
         const update = nodeState as any;
         accumulated = { ...accumulated, ...update };
 
-        // 输出该节点的 trace
-        if (update.trace && Array.isArray(update.trace)) {
-          for (const t of update.trace) {
-            yield t;  // 节点执行轨迹
+        // trace 经过 reducer 累积后可能是全量历史，取最后一个（当前节点新增的）
+        const traceArr: string[] | undefined = update.trace;
+        if (traceArr && Array.isArray(traceArr) && traceArr.length > 0) {
+          for (const t of traceArr) {
+            yield { node: nodeName, trace: t };
           }
         }
       }
