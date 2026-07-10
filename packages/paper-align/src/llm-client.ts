@@ -61,7 +61,13 @@ export class LLMClient {
 }
 
 export function extractJson<T>(text: string): T {
-    const trimmed = text.trim();
+    let trimmed = text.trim();
+
+    // 如果 LLM 用了 ```json 前缀但没有闭合标签，直接去掉前缀
+    const jsonPrefix = trimmed.match(/^```(?:json)?\s*/);
+    if (jsonPrefix) {
+        trimmed = trimmed.slice(jsonPrefix[0].length);
+    }
 
     try {
         return JSON.parse(trimmed) as T;

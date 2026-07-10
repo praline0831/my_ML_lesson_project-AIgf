@@ -6,6 +6,7 @@ const AR5IV_BASE = 'https://ar5iv.labs.arxiv.org/html/';
 
 export interface PaperParserOptions {
     claimCount?: number;
+    maxChars?: number;
     llm?: LLMClient;
 }
 
@@ -22,7 +23,7 @@ export class PaperParser {
 
     constructor(llm: LLMClient, private options: PaperParserOptions = {}) {
         this.llm = llm;
-        this.options = { claimCount: 15, ...options };
+        this.options = { claimCount: 15, maxChars: 15000, ...options };
     }
 
     async parse(arxivIdOrUrl: string): Promise<ParsedPaper> {
@@ -69,7 +70,7 @@ export class PaperParser {
     }
 
     private async extractClaims(title: string, bodyText: string): Promise<PaperClaim[]> {
-        const maxChars = 50000;
+        const maxChars = this.options.maxChars ?? 15000;
         const truncated = bodyText.length > maxChars
             ? smartTruncate(bodyText, maxChars)
             : bodyText;

@@ -57,12 +57,23 @@ function toLangChainMessage(msg: Message): BaseMessage {
 }
 
 /**
+ * 确认请求（Human-in-the-loop）
+ */
+export interface ConfirmRequest {
+  id: string;
+  name: string;
+  args: Record<string, unknown>;
+}
+
+/**
  * 流式回调：当节点完成时被调用（用于实时显示执行轨迹）
  */
 export interface StreamCallbacks {
   onNode?: (nodeName: string, data: unknown) => void;
   onToken?: (token: string) => void;   // LLM 输出 token 时
   onTrace?: (trace: string[]) => void;
+  onConfirm?: (req: ConfirmRequest) => void;
+  onMessage?: (msg: string) => void;   // 节点内部发出的状态消息（如工具执行中）
 }
 
 /**
@@ -81,6 +92,25 @@ export abstract class Agent {
   protected streamCallbacks?: StreamCallbacks;
   /** Skill 管理器（Claude 风格） */
   protected skills: SkillsManager = new SkillsManager();
+
+  /**
+   * Human-in-the-loop 确认队列
+   * 网关通过 resolveConfirm() 将用户决策注入正在等待的 act 节点
+   */
+  static confirmQueue = new Map<string, { resolve: (value: string) => void; reject: (err: Error) => void }>();
+
+  /**
+   * 注入用户对工具调用的决策
+   * @returns true 如果找到对应的等待请求
+   */
+  static resolveConfirm(id: string, decision: 'confirmed' | 'rejected'): boolean {
+    const entry = Agent.confirmQueue.get(id);
+    if (entry) {
+      entry.resolve(decision);
+      return true;
+    }
+    return false;
+  }
 
   constructor(config: AgentConfig = {}) {
     this.config = { maxSteps: 10, verbose: false, ...config };
@@ -286,27 +316,92 @@ export abstract class Agent {
         };
       })
 
-      // 3. act 节点
+      // 3. act 节点（Human-in-the-loop：工具调用前先确认）
       .addNode('act', async (state) => {
-        const lastAI = [...state.messages].reverse().find((m) => m instanceof AIMessage);
-        const content = lastAI?.content?.toString() ?? '';
-        const toolCall = self.parseToolCall(content);
+        try {
+          const lastAI = [...state.messages].reverse().find((m) => m instanceof AIMessage);
+          const content = lastAI?.content?.toString() ?? '';
+          const toolCall = self.parseToolCall(content);
 
-        if (!toolCall) {
+          if (!toolCall) {
+            return {
+              finalOutput: content,
+              steps: 1,
+              trace: ['✅ [act] 无工具调用，结束'],
+            };
+          }
+
+          // ── Human-in-the-loop ──
+          const confirmId = crypto.randomUUID();
+          const confirmPromise = new Promise<string>((resolve, reject) => {
+            Agent.confirmQueue.set(confirmId, { resolve, reject });
+            setTimeout(() => {
+              const entry = Agent.confirmQueue.get(confirmId);
+              if (entry) {
+                entry.reject(new Error('确认超时'));
+                Agent.confirmQueue.delete(confirmId);
+              }
+            }, 30_000);
+          });
+
+          self.streamCallbacks?.onConfirm?.({
+            id: confirmId, name: toolCall.name, args: toolCall.args,
+          });
+
+          let decision: string;
+          try {
+            decision = await confirmPromise;
+          } catch {
+            decision = 'rejected';
+          }
+          Agent.confirmQueue.delete(confirmId);
+
+          if (decision !== 'confirmed') {
+            return {
+              messages: [new ToolMessage({
+                content: `[用户拒绝了工具调用: ${toolCall.name}]`,
+                tool_call_id: toolCall.name,
+              })],
+              steps: 1,
+              trace: [`⏸️ [act] 用户拒绝了工具调用: ${toolCall.name}(${JSON.stringify(toolCall.args)})`],
+            };
+          }
+
+          // ── 确认通过，执行工具 ──
+          const traceEntry = `🔧 [act] 调用工具: ${toolCall.name}(${JSON.stringify(toolCall.args)})`;
+          self.streamCallbacks?.onMessage?.(`⏳ 工具「${toolCall.name}」执行中，请稍候...`);
+
+          let result: unknown;
+          try {
+            result = await self.callTool(toolCall.name, toolCall.args);
+          } catch (e) {
+            const errMsg = e instanceof Error ? e.message : String(e);
+            console.error(`[act] 工具执行失败: ${toolCall.name}`, errMsg);
+            return {
+              messages: [new ToolMessage({
+                content: `工具 "${toolCall.name}" 执行失败: ${errMsg}`,
+                tool_call_id: toolCall.name,
+              })],
+              steps: 1,
+              trace: [traceEntry, `   ↳ 错误: ${errMsg}`],
+            };
+          }
+          const resultStr = String(result);
+          self.streamCallbacks?.onMessage?.(`✅ 工具「${toolCall.name}」执行完成`);
           return {
-            finalOutput: content,
+            messages: [new ToolMessage({ content: resultStr, tool_call_id: toolCall.name })],
             steps: 1,
-            trace: ['✅ [act] 无工具调用，结束'],
+            trace: [traceEntry, `   ↳ 工具返回: ${resultStr.slice(0, 200)}...`],
+          };
+        } catch (e) {
+          const errMsg = e instanceof Error ? e.message : String(e);
+          console.error('[act] 节点内部错误:', errMsg);
+          return {
+            finalOutput: `[act 节点内部错误: ${errMsg}]`,
+            steps: 1,
+            trace: [`❌ [act] 节点内部错误: ${errMsg}`],
           };
         }
-
-        const traceEntry = `🔧 [act] 调用工具: ${toolCall.name}(${JSON.stringify(toolCall.args)})`;
-        const result = await self.callTool(toolCall.name, toolCall.args);
-        return {
-          messages: [new ToolMessage({ content: String(result), tool_call_id: toolCall.name })],
-          steps: 1,
-          trace: [traceEntry, `   ↳ 工具返回: ${String(result).slice(0, 100)}...`],
-        };
       })
 
       // 4. summarize 节点 - 每 N 轮自动总结对话并写入长期记忆
@@ -463,22 +558,36 @@ export abstract class Agent {
     // 用 graph.stream 逐节点返回
     // LangGraph 0.2 的 stream 返回 Promise<ReadableStream>，需要 [Symbol.asyncIterator]
     const streamPromise = this.graph.stream(initialState) as any;
-    const stream = await streamPromise;
-    for await (const chunk of stream) {
-      // 调试：输出 chunk 结构（稳定后删掉）
-      if (this.verbose) console.error('[stream-chunk] keys:', Object.keys(chunk), 'event:', (chunk as any).event, 'name:', (chunk as any).name);
-      for (const [nodeName, nodeState] of Object.entries(chunk)) {
-        const update = nodeState as any;
-        accumulated = { ...accumulated, ...update };
+    let stream: any;
+    try {
+      stream = await streamPromise;
+    } catch (e) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      yield { node: '__error__', trace: `Graph 编译错误: ${errMsg}` };
+      yield ['__DONE__', `Graph 编译错误: ${errMsg}`];
+      return;
+    }
+    try {
+      for await (const chunk of stream) {
+        // 调试：输出 chunk 结构（稳定后删掉）
+        if (this.verbose) console.error('[stream-chunk] keys:', Object.keys(chunk), 'event:', (chunk as any).event, 'name:', (chunk as any).name);
+        for (const [nodeName, nodeState] of Object.entries(chunk)) {
+          const update = nodeState as any;
+          accumulated = { ...accumulated, ...update };
 
-        // trace 经过 reducer 累积后可能是全量历史，取最后一个（当前节点新增的）
-        const traceArr: string[] | undefined = update.trace;
-        if (traceArr && Array.isArray(traceArr) && traceArr.length > 0) {
-          for (const t of traceArr) {
-            yield { node: nodeName, trace: t };
+          // trace 经过 reducer 累积后可能是全量历史，取最后一个（当前节点新增的）
+          const traceArr: string[] | undefined = update.trace;
+          if (traceArr && Array.isArray(traceArr) && traceArr.length > 0) {
+            for (const t of traceArr) {
+              yield { node: nodeName, trace: t };
+            }
           }
         }
       }
+    } catch (e) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      console.error('[runStream] graph stream 错误:', errMsg);
+      yield { node: '__error__', trace: `❌ 执行错误: ${errMsg}` };
     }
 
     const lastAI = [...accumulated.messages].reverse().find((m) => m instanceof AIMessage);

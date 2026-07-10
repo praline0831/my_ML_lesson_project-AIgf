@@ -19,7 +19,7 @@ export function createAgent(config: {
             endpoint: 'http://localhost:11434',
             model: 'gemma4:31b-cloud',
             temperature: 0.7,
-            maxTokens: 2048,
+            maxTokens: 8192,
         }),
     );
 

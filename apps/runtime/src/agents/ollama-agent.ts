@@ -42,15 +42,27 @@ export class OllamaAgent extends Agent {
 
     /**
      * 解析 Ollama 风格的工具调用
-     * 期望格式: {"action": "tool_call", "action_input": {"name": "...", "args": {...}}}
+     *
+     * 兼容两种格式：
+     *   1. 简单: <tool>{"name":"...","args":{...}}</tool>（推荐，system prompt 中的格式）
+     *   2. 旧式: {"action": "tool_call", "action_input": {"name": "...", "args": {...}}}
      */
     protected parseToolCall(response: string): { name: string; args: Record<string, unknown> } | null {
         try {
-            // 1. 先尝试在 <tool> 标签里找 JSON
+            // 先尝试在 <tool> 标签里找 JSON
             const tagMatch = response.match(/<tool>([\s\S]*?)<\/tool>/);
             const jsonStr = tagMatch ? tagMatch[1] : response;
             const parsed = JSON.parse(jsonStr);
 
+            // 格式1: 直接 {name, args}
+            if (parsed.name && typeof parsed.name === 'string') {
+                return {
+                    name: parsed.name,
+                    args: parsed.args ?? {},
+                };
+            }
+
+            // 格式2: {action: "tool_call", action_input: {name, args}}
             if (parsed.action === 'tool_call' && parsed.action_input) {
                 return {
                     name: parsed.action_input.name,

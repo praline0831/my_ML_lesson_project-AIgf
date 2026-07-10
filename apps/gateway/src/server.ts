@@ -1,6 +1,6 @@
+import { Agent, ConfirmRequest, createAgent, paperTools } from "@agent/runtime";
 import { arxivService, deepResearchService, generateAnalysisDoc, generateResearchReport, generateSearchResultDoc } from "@agent/paper";
 import { LLMProviderAdapter, PaperAlignAgent } from "@agent/paper-align";
-import { createAgent, paperTools } from "@agent/runtime";
 import cors from "cors";
 import express from "express";
 import { existsSync, mkdirSync, writeFileSync } from "fs";
@@ -18,6 +18,104 @@ for (const tool of paperTools) {
   agent.registerTool(tool.name, tool.execute);
   agent.addToolDescription(tool.name, tool.description);
 }
+
+/** 最近一次对齐报告（供前端对齐模块 UI 读取） */
+let lastAlignReport: import("@agent/paper-align").AlignmentReport | null = null;
+
+// ── Agent-to-Agent: align_paper ──
+// Chat agent 可以委托 PaperAlignAgent 干活，无需用户在独立界面操作
+agent.registerTool('align_paper', async (args) => {
+  const arxivId = args.arxiv_id as string;
+  const repoUrl = args.repo_url as string | undefined;
+  if (!arxivId || typeof arxivId !== 'string') {
+    throw new Error('请提供 arxiv_id（如 "2106.09685"）');
+  }
+
+  const sharedProvider = agent.getLLMProvider();
+  const alignAgent = new PaperAlignAgent({
+    llm: new LLMProviderAdapter(sharedProvider),
+    githubToken: process.env.GITHUB_TOKEN,
+    proxyUrl: process.env.HTTPS_PROXY || process.env.HTTP_PROXY,
+  });
+
+  let report;
+  try {
+    report = await alignAgent.align(arxivId, repoUrl);
+  } catch (e) {
+    const errMsg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+    console.error('[align_paper] align 失败:', e);
+    throw new Error(`论文对齐失败 (arxiv_id=${arxivId}): ${errMsg}`);
+  }
+
+  // 保存报告供前端对齐模块 UI 读取
+  lastAlignReport = report;
+
+  // 自动注入对齐结果到 agent 的长期记忆（与 /align/run 一致）
+  const memory = agent.getMemory();
+  if (memory && report.rows.length > 0) {
+    try {
+      await memory.longTerm.addSummary(
+        report.paper.title,
+        `Aligned ${report.rows.length} claims: ${report.summary.matched} match, ${report.summary.partial} partial, ${report.summary.mismatch} mismatch, ${report.summary.missing} missing`,
+        [report.paper.title],
+      );
+      for (const row of report.rows) {
+        if (row.matchedFunction) {
+          await memory.longTerm.addAlignmentResult(
+            row.claim.description, row.claim.location,
+            row.matchedFunction.name, row.matchedFunction.file,
+            row.status, [report.paper.title],
+          );
+        } else {
+          await memory.longTerm.addAlignmentResult(
+            row.claim.description, row.claim.location,
+            '', '', row.status, [report.paper.title],
+          );
+        }
+      }
+      await memory.save();
+    } catch (e) {
+      console.error('[Memory injection error]', e);
+    }
+  }
+
+  // 返回摘要文本（LLM 能直接读懂）
+  const rows = report.rows;
+  const lines: string[] = [];
+  lines.push(`📄 **${report.paper.title}**`);
+  lines.push(`🔗 https://arxiv.org/abs/${report.paper.arxivId}`);
+  if (report.repo) lines.push(`📂 ${report.repo.owner}/${report.repo.repo}`);
+  lines.push('');
+  lines.push(`**对齐摘要**：共 ${report.summary.total} 个声明`);
+  lines.push(`- ✅ 完全匹配: ${report.summary.matched}`);
+  lines.push(`- 🟡 部分匹配: ${report.summary.partial}`);
+  lines.push(`- ❌ 存在偏差: ${report.summary.mismatch}`);
+  lines.push(`- ❔ 代码缺失: ${report.summary.missing}`);
+  if (report.summary.total > 0) {
+    const coverage = ((report.summary.matched + report.summary.partial) / report.summary.total * 100).toFixed(0);
+    lines.push(`- 📊 代码覆盖率: ${coverage}%`);
+  }
+  lines.push('');
+  lines.push('**声明清单**：');
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const icon = r.status === 'match' ? '✅' : r.status === 'partial' ? '🟡' : r.status === 'mismatch' ? '❌' : '❔';
+    const code = r.matchedFunction
+      ? `→ ${r.matchedFunction.file}:${r.matchedFunction.name} (L${r.matchedFunction.startLine})`
+      : '→ 未找到对应代码';
+    lines.push(`${i + 1}. ${icon} ${r.claim.description} — ${code}`);
+    lines.push(`    ${r.note} (置信度 ${(r.confidence * 100).toFixed(0)}%)`);
+  }
+
+  return lines.join('\n');
+});
+agent.addToolDescription(
+  'align_paper',
+  '论文-代码对齐工具。给定一个 ArXiv ID，自动解析论文中的方法声明（公式、算法、超参数等），' +
+  '然后在 GitHub 仓库中找到对应的代码实现，逐条分析对齐程度（完全匹配/部分匹配/偏差/缺失）。' +
+  '参数：arxiv_id（必填，如 "2106.09685"），repo_url（可选，GitHub 仓库地址）。' +
+  '返回结构化对齐报告，包含每个声明的匹配结果、对应代码文件和行号。',
+);
 
 /** 健康检查 */
 app.get("/health", (_req, res) => {
@@ -107,6 +205,12 @@ app.post("/chat/stream", async (req, res) => {
         aiBuffer += token;
         send({ type: "token", content: token });
       },
+      onConfirm: (req: ConfirmRequest) => {
+        send({ type: "confirm", id: req.id, name: req.name, args: req.args });
+      },
+      onMessage: (msg) => {
+        send({ type: "node", name: "system", trace: msg });
+      },
     });
 
     send({ type: "user", content: message });
@@ -124,10 +228,14 @@ app.post("/chat/stream", async (req, res) => {
           send({ type: "done", output, id: assistantMsgId });
         }
       } else if (typeof chunk === "object" && chunk !== null && 'node' in chunk) {
+        const nodeName = (chunk as any).node;
+        // 错误节点同时转发为 error 事件
+        if (nodeName === '__error__') {
+          send({ type: "error", error: (chunk as any).trace });
+        }
         // 结构化节点事件
-        send({ type: "node", name: (chunk as any).node, trace: (chunk as any).trace });
+        send({ type: "node", name: nodeName, trace: (chunk as any).trace });
       } else if (typeof chunk === "string") {
-        // 兼容旧格式（纯文本 trace）
         send({ type: "node", name: "unknown", trace: chunk });
       }
     }
@@ -137,6 +245,35 @@ app.post("/chat/stream", async (req, res) => {
     console.error("[Gateway] /chat/stream 错误:", err);
     res.write(`data: ${JSON.stringify({ type: "error", error: err instanceof Error ? err.message : String(err) })}\n\n`);
     res.end();
+  }
+});
+
+/**
+ * Human-in-the-loop：用户对工具调用的确认/拒绝
+ *
+ * 当 agent 调用工具时，/chat/stream 会发出 type:"confirm" 事件，
+ * 前端弹出确认对话框，用户点击后调用此接口注入决策。
+ */
+app.post("/chat/confirm", (req, res) => {
+  try {
+    const { id, decision } = req.body ?? {};
+    if (typeof id !== "string" || !id) {
+      res.status(400).json({ error: "缺少 id" });
+      return;
+    }
+    if (decision !== true && decision !== false) {
+      res.status(400).json({ error: "decision 必须为 true(允许) 或 false(拒绝)" });
+      return;
+    }
+    const ok = Agent.resolveConfirm(id, decision ? "confirmed" : "rejected");
+    if (ok) {
+      res.json({ ok: true, decision: decision ? "confirmed" : "rejected" });
+    } else {
+      res.status(404).json({ error: "确认请求不存在或已过期" });
+    }
+  } catch (err) {
+    console.error("[Gateway] /chat/confirm 错误:", err);
+    res.status(500).json({ error: String(err) });
   }
 });
 
@@ -401,6 +538,18 @@ app.post("/align/export", async (req, res) => {
     res.status(500).json({
       error: err instanceof Error ? err.message : String(err),
     });
+  }
+});
+
+/**
+ * 返回最近一次对齐报告（供前端对齐模块 UI 渲染）
+ * 由 chat agent 的 align_paper 工具写入
+ */
+app.get("/align/last-result", (_req, res) => {
+  if (lastAlignReport) {
+    res.json({ report: lastAlignReport });
+  } else {
+    res.json({ report: null });
   }
 });
 

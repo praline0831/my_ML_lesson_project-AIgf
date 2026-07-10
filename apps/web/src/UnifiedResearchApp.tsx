@@ -123,6 +123,11 @@ export function UnifiedResearchApp() {
     const [chatLoading, setChatLoading] = useState(false);
     const [customContext, setCustomContext] = useState("");
     const [execSteps, setExecSteps] = useState<ExecStep[]>([]);
+    const [pendingConfirm, setPendingConfirm] = useState<{
+        id: string;
+        name: string;
+        args: Record<string, unknown>;
+    } | null>(null);
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
     const scrollToBottom = () => {
@@ -291,8 +296,24 @@ export function UnifiedResearchApp() {
                                 time: Date.now(),
                             };
                             setExecSteps((prev) => [...prev, step]);
+                        } else if (payload.type === "confirm") {
+                            setPendingConfirm({
+                                id: payload.id,
+                                name: payload.name,
+                                args: payload.args,
+                            });
                         } else if (payload.type === "done") {
-                            console.log("[Stream done]");
+                            // chat 完成 → 检查是否有新的对齐报告供对齐模块展示
+                            fetch(`${API_BASE}/align/last-result`)
+                                .then(r => r.json())
+                                .then(data => {
+                                    if (data.report) {
+                                        setAlignmentReport(data.report);
+                                        setArxivIdInput(data.report.paper.arxivId);
+                                        setSelectedClaimIndex(0);
+                                    }
+                                })
+                                .catch(() => {});
                         } else if (payload.type === "error") {
                             throw new Error(payload.error);
                         }
@@ -313,6 +334,20 @@ export function UnifiedResearchApp() {
             setChatLoading(false);
             setTimeout(scrollToBottom, 100);
         }
+    };
+
+    const handleConfirm = async (decision: boolean) => {
+        if (!pendingConfirm) return;
+        try {
+            await fetch(`${API_BASE}/chat/confirm`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ id: pendingConfirm.id, decision }),
+            });
+        } catch (e) {
+            console.error("Confirm failed:", e);
+        }
+        setPendingConfirm(null);
     };
 
     const buildContextMessage = () => {
@@ -683,6 +718,16 @@ export function UnifiedResearchApp() {
                     <ExecTimeline steps={execSteps} />
                 )}
 
+                {/* Human-in-the-loop 确认对话框 */}
+                {pendingConfirm && (
+                    <ConfirmDialog
+                        name={pendingConfirm.name}
+                        args={pendingConfirm.args}
+                        onAllow={() => handleConfirm(true)}
+                        onReject={() => handleConfirm(false)}
+                    />
+                )}
+
                 <div style={{ display: "flex", gap: 8 }}>
                     <input
                         value={chatInput}
@@ -839,6 +884,80 @@ function MemoryPanel({ apiBase }: { apiBase: string }) {
                     {items.length === 0 && <p style={{ color: "#999" }}>知识库为空，开始对话或对齐后会自动填充</p>}
                 </div>
             )}
+        </div>
+    );
+}
+
+// ───────────── Human-in-the-loop 确认对话框 ─────────────
+
+function ConfirmDialog({
+    name,
+    args,
+    onAllow,
+    onReject,
+}: {
+    name: string;
+    args: Record<string, unknown>;
+    onAllow: () => void;
+    onReject: () => void;
+}) {
+    const [allowing, setAllowing] = useState(false);
+    const [rejecting, setRejecting] = useState(false);
+
+    return (
+        <div style={{
+            position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            zIndex: 1000,
+        }}>
+            <div style={{
+                background: "white", borderRadius: 12, padding: 24,
+                maxWidth: 480, width: "90%", boxShadow: "0 8px 32px rgba(0,0,0,0.2)",
+            }}>
+                <div style={{ fontSize: 20, marginBottom: 12 }}>🤔 Agent 请求执行工具</div>
+                <div style={{ background: "#f8f9fa", borderRadius: 8, padding: 14, marginBottom: 16 }}>
+                    <div style={{ marginBottom: 8 }}>
+                        <span style={{ fontSize: 12, color: "#666", fontWeight: 600 }}>工具</span>
+                        <div style={{ fontSize: 16, fontWeight: 600, color: "#1a73e8", marginTop: 2 }}>{name}</div>
+                    </div>
+                    <div>
+                        <span style={{ fontSize: 12, color: "#666", fontWeight: 600 }}>参数</span>
+                        <pre style={{
+                            background: "#fff", border: "1px solid #e0e0e0", borderRadius: 6,
+                            padding: 10, fontSize: 13, margin: "4px 0 0", overflowX: "auto",
+                            whiteSpace: "pre-wrap", wordBreak: "break-all",
+                        }}>{JSON.stringify(args, null, 2)}</pre>
+                    </div>
+                </div>
+                <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                    <button
+                        onClick={() => { setRejecting(true); onReject(); }}
+                        disabled={allowing || rejecting}
+                        style={{
+                            padding: "10px 20px", borderRadius: 8, fontSize: 14,
+                            background: rejecting ? "#e8eaed" : "white",
+                            color: rejecting ? "#999" : "#a50e0e",
+                            border: rejecting ? "1px solid #e8eaed" : "1px solid #a50e0e",
+                            cursor: allowing || rejecting ? "not-allowed" : "pointer",
+                        }}
+                    >
+                        {rejecting ? "已拒绝" : "❌ 拒绝"}
+                    </button>
+                    <button
+                        onClick={() => { setAllowing(true); onAllow(); }}
+                        disabled={allowing || rejecting}
+                        style={{
+                            padding: "10px 20px", borderRadius: 8, fontSize: 14,
+                            background: allowing ? "#e8eaed" : "#1a73e8",
+                            color: allowing ? "#999" : "white",
+                            border: "none",
+                            cursor: allowing || rejecting ? "not-allowed" : "pointer",
+                        }}
+                    >
+                        {allowing ? "已允许" : "✅ 允许"}
+                    </button>
+                </div>
+            </div>
         </div>
     );
 }

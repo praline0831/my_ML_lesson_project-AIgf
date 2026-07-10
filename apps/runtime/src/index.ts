@@ -9,6 +9,7 @@ export type {
 
 // 核心类
 export { Agent } from './agent.js';
+export type { ConfirmRequest, StreamCallbacks } from './agent.js';
 export { BaseLLMClient } from './llm.js';
 export type { LLMConfig, LLMProvider } from './llm.js';
 export { ReactLoop } from './react-loop.js';
