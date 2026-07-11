@@ -233,7 +233,7 @@ function buildSignature(lines: string[], startLine: number, indent: number): str
     return first;
 }
 
-function rankByHeuristic(functions: CodeFunction[], paperTitle?: string, paperAbstract?: string): CodeFunction[] {
+export function rankByHeuristic(functions: CodeFunction[], paperTitle?: string, paperAbstract?: string): CodeFunction[] {
     const paperTokens = new Set<string>();
     if (paperTitle || paperAbstract) {
         const raw = `${paperTitle || ''} ${paperAbstract || ''}`.toLowerCase();

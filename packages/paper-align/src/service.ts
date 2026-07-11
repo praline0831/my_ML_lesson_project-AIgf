@@ -1,5 +1,5 @@
 import { Aligner } from './aligner.js';
-import { extractPythonFunctions } from './key-function-selector.js';
+import { extractPythonFunctions, rankByHeuristic } from './key-function-selector.js';
 import { LLMClient, defaultLLMClient } from './llm-client.js';
 import { PaperParser, normalizeArxivId } from './paper-parser.js';
 import { RepoFetcher } from './repo-fetcher.js';
@@ -85,19 +85,31 @@ export class PaperAlignAgent {
         const paper = await this.cachedOrFetch(this.paperCache, arxivId, () =>
             this.paperParser.parse(arxivId)
         );
-        this.progress('paper', `extracted ${paper.claims.length} claims`);
+        const totalClaims = paper.components.reduce((s, c) => s + c.claims.length, 0);
+        this.progress('paper', `identified ${paper.components.length} components, ${totalClaims} total claims`);
 
         const repoUrl = explicitRepoUrl || paper.repoUrl;
         if (!repoUrl) {
             this.progress('repo', 'no GitHub link found in paper, skipping code alignment');
+            const allClaims = paper.components.flatMap(c => c.claims);
             return buildReport({
                 paper: {
                     arxivId: paper.arxivId,
                     title: paper.title,
                 },
-                rows: paper.claims.map(c => ({
-                    claim: c,
-                    status: 'missing',
+                components: paper.components.map(c => ({
+                    component: c,
+                    rows: c.claims.map(cl => ({
+                        claim: cl,
+                        componentName: c.name,
+                        status: 'missing' as const,
+                        note: 'no GitHub link in paper',
+                        confidence: 1.0,
+                    })),
+                })),
+                rows: allClaims.map(cl => ({
+                    claim: cl,
+                    status: 'missing' as const,
                     note: 'no GitHub link in paper',
                     confidence: 1.0,
                 })),
@@ -110,13 +122,26 @@ export class PaperAlignAgent {
         );
         this.progress('repo', `found ${repoInfo.candidateFiles.length} candidate files`);
 
-        this.progress('functions', `extracting all functions from ${repoInfo.candidateFiles.length} files ...`);
+        this.progress('functions', `extracting functions from ${repoInfo.candidateFiles.length} files ...`);
         const allFunctions = this.extractAllFunctions(repoInfo.candidateFiles);
-        this.progress('functions', `extracted ${allFunctions.length} functions total`);
+        this.progress('functions', `extracted ${allFunctions.length} functions total, ranking by heuristic ...`);
 
-        this.progress('align', 'aligning all claims ↔ all functions (single-pass) ...');
-        const rows = await this.aligner.align(paper.claims, allFunctions, paper.title);
-        this.progress('align', `alignment complete: ${rows.length} rows`);
+        const ranked = rankByHeuristic(allFunctions, paper.title, paper.abstract);
+        const functionPool = ranked.slice(0, 30);
+        this.progress('functions', `using top ${functionPool.length} functions for alignment`);
+
+        this.progress('align', `aligning ${paper.components.flatMap(c => c.claims).length} claims across ${functionPool.length} functions ...`);
+        const rows = await this.aligner.alignByComponents(
+            paper.components,
+            functionPool,
+            paper.title
+        );
+        this.progress('align', `alignment complete: ${rows.length} rows (${rows.filter(r => r.status === 'match' || r.status === 'partial').length} matched)`);
+
+        const componentResults = paper.components.map(comp => ({
+            component: comp,
+            rows: rows.filter(r => r.componentName === comp.name),
+        }));
 
         return buildReport({
             paper: {
@@ -129,6 +154,7 @@ export class PaperAlignAgent {
                 repo: repoInfo.repo,
                 url: repoUrl,
             },
+            components: componentResults,
             rows,
         });
     }
@@ -150,4 +176,4 @@ export { LLMClient, defaultLLMClient } from './llm-client.js';
 export { PaperParser, extractRepoUrl, normalizeArxivId } from './paper-parser.js';
 export { RepoFetcher } from './repo-fetcher.js';
 export { buildReport } from './reporter.js';
-export type { AlignmentReport, AlignmentRow, CodeFunction, PaperClaim, ParsedPaper, ParsedRepo, RepoFile } from './types.js';
+export type { AlignmentReport, AlignmentRow, CodeFunction, PaperClaim, ParsedPaper, ParsedRepo, RepoFile, PaperComponent, EvidenceSpan, VariableMapping } from './types.js';

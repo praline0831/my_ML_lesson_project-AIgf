@@ -1,24 +1,9 @@
-/**
- * 论文-代码对齐 - DeepWiki 风格 Q&A 页面
- *
- * 布局：
- *   ┌─────────── 输入区 ───────────┐
- *   │ arxiv id  | repo  |  ▶ Run  │
- *   ├────────── 进度条 ────────────┤
- *   ├──────────┬──────────────────┤
- *   │  Q&A 列表  │  VSCode 代码块  │
- *   │  (claims) │  (right pane)   │
- *   └──────────┴──────────────────┘
- *
- * 点击左侧 claim → 右侧滚动到对应代码
- */
-
 import { useState } from "react";
 import { CodeViewer } from "./components/CodeViewer";
 
 const API_BASE = import.meta.env.VITE_GATEWAY_URL ?? "http://localhost:4000";
 
-// ───────────── 类型（与 gateway 对齐） ─────────────
+// ───────────── 类型 ─────────────
 
 type AlignStatus = "match" | "partial" | "mismatch" | "missing";
 type ClaimType = "formula" | "loss" | "algorithm" | "hyperparam" | "training" | "data" | "arch";
@@ -31,6 +16,20 @@ interface PaperClaim {
     importance?: 1 | 2 | 3;
 }
 
+interface VariableMapping {
+    formulaVar: string;
+    codeVar: string;
+    context: string;
+}
+
+interface EvidenceSpan {
+    startLine: number;
+    endLine: number;
+    codeSnippet: string;
+    formulaContext?: string;
+    variableMappings?: VariableMapping[];
+}
+
 interface CodeFunction {
     file: string;
     name: string;
@@ -41,9 +40,20 @@ interface CodeFunction {
     isKey?: boolean;
 }
 
+interface PaperComponent {
+    name: string;
+    description: string;
+    priority: 1 | 2 | 3;
+    location: string;
+    claims: PaperClaim[];
+}
+
 interface AlignmentRow {
     claim: PaperClaim;
+    componentName?: string;
     matchedFunction?: CodeFunction;
+    matchedFunctions?: CodeFunction[];
+    evidenceSpans?: EvidenceSpan[];
     status: AlignStatus;
     note: string;
     confidence: number;
@@ -52,10 +62,16 @@ interface AlignmentRow {
     evidenceLine?: number;
 }
 
+interface ComponentResult {
+    component: PaperComponent;
+    rows: AlignmentRow[];
+}
+
 interface AlignmentReport {
     paper: { arxivId: string; title: string; repoUrl?: string };
     repo?: { owner: string; repo: string; url: string };
     generatedAt: string;
+    components?: ComponentResult[];
     rows: AlignmentRow[];
     summary: { total: number; matched: number; partial: number; mismatch: number; missing: number };
     markdown: string;
@@ -83,6 +99,12 @@ const CLAIM_TYPE_META: Record<ClaimType, { icon: string; label: string; color: s
     arch: { icon: "🏛️", label: "结构", color: "#455a64" },
 };
 
+const PRIORITY_META: Record<number, { icon: string; label: string; color: string }> = {
+    1: { icon: "🔴", label: "核心贡献", color: "#c62828" },
+    2: { icon: "🟡", label: "支撑组件", color: "#f9a825" },
+    3: { icon: "🔵", label: "实现细节", color: "#1565c0" },
+};
+
 // ───────────── 主组件 ─────────────
 
 export function AlignApp() {
@@ -93,6 +115,7 @@ export function AlignApp() {
     const [report, setReport] = useState<AlignmentReport | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [selectedIndex, setSelectedIndex] = useState(0);
+    const [expandedComponents, setExpandedComponents] = useState<Record<string, boolean>>({});
 
     const run = async () => {
         if (!arxivId.trim() || loading) return;
@@ -140,6 +163,13 @@ export function AlignApp() {
                         } else if (payload.type === "done") {
                             setReport(payload.report);
                             setSelectedIndex(0);
+                            if (payload.report?.components) {
+                                const expanded: Record<string, boolean> = {};
+                                payload.report.components.forEach((c: ComponentResult) => {
+                                    expanded[c.component.name] = true;
+                                });
+                                setExpandedComponents(expanded);
+                            }
                         } else if (payload.type === "error") {
                             throw new Error(payload.error);
                         }
@@ -159,23 +189,15 @@ export function AlignApp() {
 
     return (
         <div style={{ maxWidth: 1400, margin: "0 auto", padding: 20, fontFamily: "system-ui, sans-serif" }}>
-            {/* 顶部：标题 + 输入 */}
+            {/* 顶部 */}
             <div style={{ marginBottom: 16 }}>
                 <h1 style={{ margin: 0, color: "#1a73e8" }}>🔬 论文-代码对齐</h1>
                 <p style={{ color: "#666", margin: "4px 0 12px" }}>
-                    DeepWiki 风格问答：把论文的关键声明对齐到代码仓库中最相关的函数
+                    分层对齐：先识别核心组件，再精确定位公式实现的行级代码
                 </p>
-
-                <div
-                    style={{
-                        display: "flex",
-                        gap: 8,
-                        background: "#f8f9fa",
-                        padding: 12,
-                        borderRadius: 8,
-                        alignItems: "center",
-                    }}
-                >
+                <div style={{
+                    display: "flex", gap: 8, background: "#f8f9fa", padding: 12, borderRadius: 8, alignItems: "center",
+                }}>
                     <span style={{ fontSize: 12, color: "#666" }}>📄 arXiv:</span>
                     <input
                         value={arxivId}
@@ -201,31 +223,14 @@ export function AlignApp() {
 
             {/* 错误 */}
             {error && (
-                <div
-                    style={{
-                        background: "#fce8e6",
-                        color: "#a50e0e",
-                        padding: 12,
-                        borderRadius: 6,
-                        marginBottom: 16,
-                        fontSize: 13,
-                    }}
-                >
+                <div style={{ background: "#fce8e6", color: "#a50e0e", padding: 12, borderRadius: 6, marginBottom: 16, fontSize: 13 }}>
                     ❌ {error}
                 </div>
             )}
 
-            {/* 进度条 */}
+            {/* 进度 */}
             {loading && progress.length > 0 && (
-                <div
-                    style={{
-                        background: "#e8f0fe",
-                        padding: 12,
-                        borderRadius: 6,
-                        marginBottom: 16,
-                        fontSize: 13,
-                    }}
-                >
+                <div style={{ background: "#e8f0fe", padding: 12, borderRadius: 6, marginBottom: 16, fontSize: 13 }}>
                     <strong>📊 进度：</strong>
                     <ul style={{ margin: "6px 0 0", paddingLeft: 20 }}>
                         {progress.slice(-6).map((p, i) => (
@@ -237,12 +242,16 @@ export function AlignApp() {
                 </div>
             )}
 
-            {/* 结果：两栏布局 */}
+            {/* 结果 */}
             {report && (
                 <AlignResult
                     report={report}
                     selectedIndex={selectedIndex}
                     onSelect={setSelectedIndex}
+                    expandedComponents={expandedComponents}
+                    onToggleComponent={(name) =>
+                        setExpandedComponents(prev => ({ ...prev, [name]: !prev[name] }))
+                    }
                 />
             )}
         </div>
@@ -255,34 +264,22 @@ function AlignResult({
     report,
     selectedIndex,
     onSelect,
+    expandedComponents,
+    onToggleComponent,
 }: {
     report: AlignmentReport;
     selectedIndex: number;
     onSelect: (i: number) => void;
+    expandedComponents: Record<string, boolean>;
+    onToggleComponent: (name: string) => void;
 }) {
-    const selected = report.rows[selectedIndex];
-
-    // 按重要度排序：3 > 2 > 1，同级按 match > partial > mismatch > missing
-    const sortedRows = [...report.rows].sort((a, b) => {
-        const ai = a.claim.importance ?? 2;
-        const bi = b.claim.importance ?? 2;
-        if (ai !== bi) return bi - ai; // 重要度降序
-        const order: Record<AlignStatus, number> = { match: 0, partial: 1, mismatch: 2, missing: 3 };
-        return order[a.status] - order[b.status];
-    });
+    const components = report.components ?? [];
+    const hasComponents = components.length > 0;
 
     return (
         <div>
             {/* 头部信息 */}
-            <div
-                style={{
-                    background: "white",
-                    border: "1px solid #e0e0e0",
-                    borderRadius: 8,
-                    padding: 14,
-                    marginBottom: 12,
-                }}
-            >
+            <div style={{ background: "white", border: "1px solid #e0e0e0", borderRadius: 8, padding: 14, marginBottom: 12 }}>
                 <h2 style={{ margin: "0 0 6px", fontSize: 18 }}>{report.paper.title}</h2>
                 <p style={{ margin: "4px 0", color: "#666", fontSize: 13 }}>
                     📄 <a href={`https://arxiv.org/abs/${report.paper.arxivId}`} target="_blank" rel="noreferrer">
@@ -297,45 +294,88 @@ function AlignResult({
                     )}
                 </p>
                 <SummaryBadges summary={report.summary} />
+                {hasComponents && (
+                    <div style={{ marginTop: 10, fontSize: 12, color: "#5f6368", lineHeight: 1.6 }}>
+                        <strong>🏗 架构总览：</strong>
+                        {components.map(({ component }) => {
+                            const pm = PRIORITY_META[component.priority] ?? PRIORITY_META[3];
+                            return (
+                                <span key={component.name} style={{ marginRight: 12, whiteSpace: "nowrap" }}>
+                                    {pm.icon} <strong>{component.name}</strong>
+                                    <span style={{ color: "#999" }}> — {component.description.slice(0, 60)}</span>
+                                </span>
+                            );
+                        })}
+                    </div>
+                )}
             </div>
 
             {/* 两栏 */}
-            <div
-                style={{
-                    display: "grid",
-                    gridTemplateColumns: "minmax(380px, 1fr) minmax(0, 1.4fr)",
-                    gap: 12,
-                    minHeight: 600,
-                }}
-            >
-                {/* 左：Q&A 列表（按重要度排序） */}
-                <div
-                    style={{
-                        background: "white",
-                        border: "1px solid #e0e0e0",
-                        borderRadius: 8,
-                        overflow: "auto",
-                        maxHeight: "75vh",
-                    }}
-                >
-                    {sortedRows.map((row) => {
-                        // 找到在原 report.rows 里的下标（点击时要更新 selectedIndex）
-                        const originalIndex = report.rows.indexOf(row);
-                        return (
-                            <ClaimCard
-                                key={originalIndex}
-                                index={originalIndex}
-                                row={row}
-                                selected={originalIndex === selectedIndex}
-                                onClick={() => onSelect(originalIndex)}
-                            />
-                        );
-                    })}
+            <div style={{
+                display: "grid",
+                gridTemplateColumns: "minmax(380px, 1fr) minmax(0, 1.4fr)",
+                gap: 12,
+                minHeight: 600,
+            }}>
+                {/* 左：分层列表 */}
+                <div style={{ background: "white", border: "1px solid #e0e0e0", borderRadius: 8, overflow: "auto", maxHeight: "75vh" }}>
+                    {hasComponents ? (
+                        components.map(({ component, rows }) => {
+                            const isExpanded = expandedComponents[component.name] ?? true;
+                            const pm = PRIORITY_META[component.priority] ?? PRIORITY_META[3];
+                            const matchCount = rows.filter(r => r.status === 'match' || r.status === 'partial').length;
+
+                            return (
+                                <div key={component.name}>
+                                    <div
+                                        onClick={() => onToggleComponent(component.name)}
+                                        style={{
+                                            padding: "10px 14px",
+                                            background: "#f8f9fa",
+                                            borderBottom: "1px solid #e0e0e0",
+                                            cursor: "pointer",
+                                            display: "flex",
+                                            alignItems: "center",
+                                            gap: 8,
+                                            position: "sticky",
+                                            top: 0,
+                                            zIndex: 1,
+                                        }}
+                                    >
+                                        <span style={{ fontSize: 11, color: "#666" }}>{isExpanded ? "▼" : "▶"}</span>
+                                        <span style={{ fontSize: 12, fontWeight: 600, color: pm.color }}>
+                                            {pm.icon} {pm.label}
+                                        </span>
+                                        <span style={{ fontSize: 13, fontWeight: 600 }}>{component.name}</span>
+                                        <span style={{ fontSize: 11, color: "#999", marginLeft: "auto" }}>
+                                            {matchCount}/{rows.length} 匹配
+                                        </span>
+                                    </div>
+                                    {isExpanded && rows.map(row => {
+                                        const originalIndex = report.rows.indexOf(row);
+                                        return (
+                                            <ClaimCard
+                                                key={originalIndex}
+                                                index={originalIndex}
+                                                row={row}
+                                                selected={originalIndex === selectedIndex}
+                                                onClick={() => onSelect(originalIndex)}
+                                            />
+                                        );
+                                    })}
+                                </div>
+                            );
+                        })
+                    ) : (
+                        report.rows.map((row, i) => (
+                            <ClaimCard key={i} index={i} row={row} selected={i === selectedIndex} onClick={() => onSelect(i)} />
+                        ))
+                    )}
                 </div>
 
-                {/* 右：代码块 */}
+                {/* 右：代码 */}
                 <div style={{ position: "sticky", top: 0, alignSelf: "start" }}>
-                    <RightPane row={selected} />
+                    <RightPane row={report.rows[selectedIndex]} />
                 </div>
             </div>
         </div>
@@ -370,42 +410,17 @@ function ClaimCard({
                 transition: "background 0.1s",
             }}
         >
-            {/* 顶部：状态 + 类型 + 重要度 + 位置 */}
+            {/* 顶部徽标 */}
             <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6, flexWrap: "wrap" }}>
-                <span
-                    style={{
-                        background: meta.bg,
-                        color: meta.color,
-                        padding: "2px 8px",
-                        borderRadius: 10,
-                        fontSize: 11,
-                        fontWeight: 600,
-                    }}
-                >
+                <span style={{ background: meta.bg, color: meta.color, padding: "2px 8px", borderRadius: 10, fontSize: 11, fontWeight: 600 }}>
                     {meta.icon} {meta.label}
                 </span>
                 {typeMeta && (
-                    <span
-                        style={{
-                            color: typeMeta.color,
-                            fontSize: 11,
-                            fontWeight: 600,
-                            background: `${typeMeta.color}14`, // 8% 透明
-                            padding: "2px 8px",
-                            borderRadius: 10,
-                        }}
-                    >
+                    <span style={{ color: typeMeta.color, fontSize: 11, fontWeight: 600, background: `${typeMeta.color}14`, padding: "2px 8px", borderRadius: 10 }}>
                         {typeMeta.icon} {typeMeta.label}
                     </span>
                 )}
-                {/* 重要度：★ 越多越核心 */}
-                <span
-                    style={{
-                        fontSize: 11,
-                        color: importance === 3 ? "#e37400" : importance === 2 ? "#5f6368" : "#bdc1c6",
-                        letterSpacing: 1,
-                        fontWeight: 600,
-                    }}
+                <span style={{ fontSize: 11, color: importance === 3 ? "#e37400" : importance === 2 ? "#5f6368" : "#bdc1c6", letterSpacing: 1, fontWeight: 600 }}
                     title={`重要度 ${importance}/3`}
                 >
                     {"★".repeat(importance)}
@@ -416,37 +431,14 @@ function ClaimCard({
                 </span>
             </div>
 
-            {/* 核心描述 */}
-            <div
-                style={{
-                    fontSize: 14,
-                    color: "#202124",
-                    fontWeight: importance === 3 ? 600 : 500,
-                    marginBottom: 4,
-                    lineHeight: 1.4,
-                }}
-            >
+            {/* 描述 */}
+            <div style={{ fontSize: 14, color: "#202124", fontWeight: importance === 3 ? 600 : 500, marginBottom: 4, lineHeight: 1.4 }}>
                 {row.claim.description}
             </div>
 
-            {/* 论文引用（如果有） */}
+            {/* 引用 */}
             {row.claim.quote && (
-                <div
-                    style={{
-                        fontSize: 12,
-                        color: "#5f6368",
-                        fontStyle: "italic",
-                        borderLeft: "2px solid #dadce0",
-                        paddingLeft: 8,
-                        margin: "4px 0 6px",
-                        lineHeight: 1.5,
-                        maxHeight: 50,
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        display: "-webkit-box",
-                        WebkitLineClamp: 2,
-                        WebkitBoxOrient: "vertical",
-                    }}
+                <div style={{ fontSize: 12, color: "#5f6368", fontStyle: "italic", borderLeft: "2px solid #dadce0", paddingLeft: 8, margin: "4px 0 6px", lineHeight: 1.5, maxHeight: 50, overflow: "hidden", textOverflow: "ellipsis", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}
                     title={row.claim.quote}
                 >
                     "{row.claim.quote}"
@@ -456,19 +448,20 @@ function ClaimCard({
             {/* 对齐说明 */}
             <div style={{ fontSize: 12, color: "#5f6368", lineHeight: 1.5 }}>{row.note}</div>
 
-            {/* 底部：函数位置 + 置信度 */}
+            {/* 证据行预览 */}
+            {row.evidenceSpans && row.evidenceSpans.length > 0 && (
+                <div style={{ marginTop: 4, display: "flex", gap: 4, flexWrap: "wrap" }}>
+                    {row.evidenceSpans.map((s, i) => (
+                        <span key={i} style={{ fontSize: 10, background: "#0e639c14", color: "#0e639c", padding: "1px 6px", borderRadius: 3, fontFamily: "monospace" }}>
+                            L{s.startLine}-{s.endLine}
+                        </span>
+                    ))}
+                </div>
+            )}
+
+            {/* 底部 */}
             {row.matchedFunction && (
-                <div
-                    style={{
-                        display: "flex",
-                        justifyContent: "space-between",
-                        alignItems: "center",
-                        marginTop: 6,
-                        fontSize: 11,
-                        color: "#5f6368",
-                        fontFamily: "monospace",
-                    }}
-                >
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 6, fontSize: 11, color: "#5f6368", fontFamily: "monospace" }}>
                     <span>
                         📍 {row.matchedFunction.file} · L{row.matchedFunction.startLine}-{row.matchedFunction.endLine}
                     </span>
@@ -507,7 +500,7 @@ function RightPane({ row }: { row: AlignmentRow | undefined }) {
                     </div>
                     <div style={{ fontSize: 13, color: "#5f6368", marginTop: 8 }}>
                         {row.status === "missing"
-                            ? "代码中未找到对应的实现（可能未开源 / 实现方式不同 / 该 claim 只是描述性）"
+                            ? "代码中未找到对应的实现"
                             : row.note}
                     </div>
                     <ReasoningPanel reasoning={row.reasoning} />
@@ -515,6 +508,8 @@ function RightPane({ row }: { row: AlignmentRow | undefined }) {
             </div>
         );
     }
+
+    const focusLine = row.evidenceLine ?? row.matchedFunction.startLine;
 
     return (
         <div style={paneStyle}>
@@ -526,34 +521,16 @@ function RightPane({ row }: { row: AlignmentRow | undefined }) {
                     start: row.matchedFunction.startLine,
                     end: row.matchedFunction.endLine,
                 }}
-                focusLine={row.evidenceLine ?? row.matchedFunction.startLine}
+                focusLine={focusLine}
                 lineNumberStart={row.matchedFunction.startLine}
                 contextWindow={4}
                 maxHeight={520}
             />
 
-            {/* 对齐结果摘要 */}
-            <div
-                style={{
-                    marginTop: 8,
-                    padding: 12,
-                    background: "#f8f9fa",
-                    borderRadius: 6,
-                    fontSize: 13,
-                    lineHeight: 1.6,
-                }}
-            >
+            <div style={{ marginTop: 8, padding: 12, background: "#f8f9fa", borderRadius: 6, fontSize: 13, lineHeight: 1.6 }}>
+                {/* 状态 */}
                 <div style={{ marginBottom: 4, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                    <span
-                        style={{
-                            background: meta.bg,
-                            color: meta.color,
-                            padding: "2px 8px",
-                            borderRadius: 10,
-                            fontSize: 11,
-                            fontWeight: 600,
-                        }}
-                    >
+                    <span style={{ background: meta.bg, color: meta.color, padding: "2px 8px", borderRadius: 10, fontSize: 11, fontWeight: 600 }}>
                         {meta.icon} {meta.label}
                     </span>
                     <span style={{ color: "#666", fontSize: 12 }}>
@@ -562,26 +539,49 @@ function RightPane({ row }: { row: AlignmentRow | undefined }) {
                 </div>
                 <div style={{ color: "#202124" }}>{row.note}</div>
 
-                {/* Evidence 证据片段（来自对齐 prompt 的新字段） */}
-                {row.evidence && (
-                    <div
-                        style={{
-                            marginTop: 8,
-                            padding: "6px 10px",
-                            background: "#0e639c14",
-                            borderLeft: "3px solid #0e639c",
-                            borderRadius: 3,
-                            fontSize: 12,
-                            fontFamily: "ui-monospace, Menlo, monospace",
-                            color: "#0e639c",
-                        }}
-                    >
+                {/* Evidence 行范围 */}
+                {row.evidenceSpans && row.evidenceSpans.length > 0 && (
+                    <div style={{ marginTop: 8 }}>
+                        <div style={{ fontWeight: 600, fontSize: 12, color: "#5f6368", marginBottom: 4 }}>📐 公式-代码对应：</div>
+                        {row.evidenceSpans.map((span, i) => (
+                            <div key={i} style={{
+                                marginBottom: 6,
+                                padding: "6px 10px",
+                                background: "#0e639c08",
+                                borderLeft: "3px solid #0e639c",
+                                borderRadius: 3,
+                                fontSize: 12,
+                            }}>
+                                <div style={{ fontFamily: "monospace", color: "#0e639c", marginBottom: 2 }}>
+                                    L{span.startLine}-{span.endLine}
+                                    {span.formulaContext && <span style={{ color: "#666", marginLeft: 8 }}>← {span.formulaContext}</span>}
+                                </div>
+                                {span.variableMappings && span.variableMappings.length > 0 && (
+                                    <div style={{ marginTop: 2, fontSize: 11, color: "#5f6368" }}>
+                                        {span.variableMappings.map((vm, j) => (
+                                            <span key={j} style={{ marginRight: 8 }}>
+                                                <strong>{vm.formulaVar}</strong> → <code>{vm.codeVar}</code>
+                                                {vm.context ? <span style={{ color: "#999" }}> ({vm.context})</span> : ''}
+                                            </span>
+                                        ))}
+                                    </div>
+                                )}
+                                <div style={{ marginTop: 4, fontFamily: "monospace", fontSize: 11, color: "#202124", whiteSpace: "pre-wrap", maxHeight: 80, overflow: "hidden" }}>
+                                    {span.codeSnippet.slice(0, 200)}
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                )}
+
+                {/* 旧版 evidence */}
+                {row.evidence && (!row.evidenceSpans || row.evidenceSpans.length === 0) && (
+                    <div style={{ marginTop: 8, padding: "6px 10px", background: "#0e639c14", borderLeft: "3px solid #0e639c", borderRadius: 3, fontSize: 12, fontFamily: "ui-monospace, Menlo, monospace", color: "#0e639c" }}>
                         <span style={{ fontWeight: 600, color: "#5f6368" }}>🔍 证据：</span>
                         {row.evidence}
                     </div>
                 )}
 
-                {/* Reasoning 推理过程（可展开） */}
                 <ReasoningPanel reasoning={row.reasoning} />
             </div>
         </div>
@@ -596,32 +596,12 @@ function ReasoningPanel({ reasoning }: { reasoning?: string }) {
         <div style={{ marginTop: 8 }}>
             <button
                 onClick={() => setOpen((o) => !o)}
-                style={{
-                    background: "transparent",
-                    border: "none",
-                    color: "#1a73e8",
-                    fontSize: 12,
-                    cursor: "pointer",
-                    padding: 0,
-                    fontFamily: "inherit",
-                }}
+                style={{ background: "transparent", border: "none", color: "#1a73e8", fontSize: 12, cursor: "pointer", padding: 0, fontFamily: "inherit" }}
             >
                 {open ? "▼" : "▶"} 💡 {open ? "隐藏推理" : "显示推理"}
             </button>
             {open && (
-                <div
-                    style={{
-                        marginTop: 4,
-                        padding: 8,
-                        background: "white",
-                        border: "1px solid #e0e0e0",
-                        borderRadius: 4,
-                        fontSize: 12,
-                        color: "#5f6368",
-                        lineHeight: 1.6,
-                        whiteSpace: "pre-wrap",
-                    }}
-                >
+                <div style={{ marginTop: 4, padding: 8, background: "white", border: "1px solid #e0e0e0", borderRadius: 4, fontSize: 12, color: "#5f6368", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
                     {reasoning}
                 </div>
             )}
@@ -631,17 +611,7 @@ function ReasoningPanel({ reasoning }: { reasoning?: string }) {
 
 function EmptyPane({ text }: { text: string }) {
     return (
-        <div
-            style={{
-                ...paneStyle,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                color: "#999",
-                fontSize: 14,
-                minHeight: 400,
-            }}
-        >
+        <div style={{ ...paneStyle, display: "flex", alignItems: "center", justifyContent: "center", color: "#999", fontSize: 14, minHeight: 400 }}>
             {text}
         </div>
     );
@@ -661,29 +631,12 @@ function SummaryBadges({ summary }: { summary: AlignmentReport["summary"] }) {
             {items.map(({ key, count }) => {
                 const meta = STATUS_META[key];
                 return (
-                    <span
-                        key={key}
-                        style={{
-                            background: meta.bg,
-                            color: meta.color,
-                            padding: "4px 10px",
-                            borderRadius: 14,
-                            fontSize: 12,
-                            fontWeight: 600,
-                        }}
-                    >
+                    <span key={key} style={{ background: meta.bg, color: meta.color, padding: "4px 10px", borderRadius: 14, fontSize: 12, fontWeight: 600 }}>
                         {meta.icon} {meta.label}: {count}
                     </span>
                 );
             })}
-            <span
-                style={{
-                    marginLeft: "auto",
-                    fontSize: 12,
-                    color: "#5f6368",
-                    alignSelf: "center",
-                }}
-            >
+            <span style={{ marginLeft: "auto", fontSize: 12, color: "#5f6368", alignSelf: "center" }}>
                 共 {summary.total} 个声明
             </span>
         </div>

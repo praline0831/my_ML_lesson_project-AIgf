@@ -22,7 +22,7 @@ export class LLMClient {
             model: this.config.model,
             messages,
             temperature: this.config.temperature ?? 0.2,
-            max_tokens: this.config.maxTokens ?? 2048,
+            max_tokens: this.config.maxTokens ?? 8192,
         };
 
         if (jsonMode && this.config.supportsJsonMode !== false) {
@@ -60,6 +60,38 @@ export class LLMClient {
     }
 }
 
+function repairJson(raw: string): string {
+    let s = raw;
+    // remove content after last complete } object (truncated junk)
+    const lastCloser = Math.max(s.lastIndexOf('}'), s.lastIndexOf(']'));
+    if (lastCloser > 0 && lastCloser < s.length - 1) {
+        s = s.slice(0, lastCloser + 1);
+    }
+    // fix stray " after } in array: }"  ->  }
+    s = s.replace(/\}"(?!\s*[,:\]\}])/g, '}');
+    // fix stray quotes between array elements: }," {  ->  },{
+    s = s.replace(/},"\s*\{/g, '},{');
+    s = s.replace(/},"\s*$/g, '}');
+    // fix stray " before { in array context
+    s = s.replace(/,\s*"\s*\{/g, ',{');
+    // fix stray closing paren after string: "text"),  ->  "text",
+    s = s.replace(/"\)\s*[,:\]\}]/g, '",');
+    s = s.replace(/"\)\s*$/g, '"');
+    // fix stray closing paren before , or } or ]
+    s = s.replace(/\)\s*[,}\]]/g, (m) => m.replace(/\)/, ''));
+    // trim trailing non-JSON (incomplete last string etc.)
+    // if the last complete value ends with a dangling string, trim it
+    s = s.replace(/,"[^"]*$/g, '');
+    // count and balance braces/brackets
+    const openBraces = (s.match(/\{/g) || []).length;
+    const closeBraces = (s.match(/\}/g) || []).length;
+    const openBrackets = (s.match(/\[/g) || []).length;
+    const closeBrackets = (s.match(/\]/g) || []).length;
+    if (openBraces > closeBraces) s += '}'.repeat(openBraces - closeBraces);
+    if (openBrackets > closeBrackets) s += ']'.repeat(openBrackets - closeBrackets);
+    return s;
+}
+
 export function extractJson<T>(text: string): T {
     let trimmed = text.trim();
 
@@ -76,37 +108,33 @@ export function extractJson<T>(text: string): T {
 
     const codeBlock = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
     if (codeBlock) {
+        const candidate = repairJson(codeBlock[1].trim());
         try {
-            return JSON.parse(codeBlock[1].trim()) as T;
+            return JSON.parse(candidate) as T;
         } catch {
         }
     }
 
+    // try extracting from first { to last }
     const firstBrace = trimmed.indexOf('{');
     const lastBrace = trimmed.lastIndexOf('}');
     if (firstBrace !== -1 && lastBrace > firstBrace) {
-        let candidate = trimmed.slice(firstBrace, lastBrace + 1);
+        let candidate = repairJson(trimmed.slice(firstBrace, lastBrace + 1));
 
         try {
             return JSON.parse(candidate) as T;
         } catch {
         }
+    }
 
-        const openBraces = (candidate.match(/\{/g) || []).length;
-        const closeBraces = (candidate.match(/\}/g) || []).length;
-        const openBrackets = (candidate.match(/\[/g) || []).length;
-        const closeBrackets = (candidate.match(/\]/g) || []).length;
-
-        const missingBraces = openBraces - closeBraces;
-        const missingBrackets = openBrackets - closeBrackets;
-
-        if (missingBraces > 0 || missingBrackets > 0) {
-            const suffix = '}'.repeat(Math.max(0, missingBraces)) + ']'.repeat(Math.max(0, missingBrackets));
-            candidate += suffix;
-            try {
-                return JSON.parse(candidate) as T;
-            } catch {
-            }
+    // handle bare array: [...] when code expected {"key": [...]}
+    const firstBracket = trimmed.indexOf('[');
+    const lastBracket = trimmed.lastIndexOf(']');
+    if (firstBracket !== -1 && lastBracket > firstBracket) {
+        let candidate = repairJson(trimmed.slice(firstBracket, lastBracket + 1));
+        try {
+            return JSON.parse(candidate) as T;
+        } catch {
         }
     }
 

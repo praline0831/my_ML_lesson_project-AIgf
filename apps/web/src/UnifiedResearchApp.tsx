@@ -380,7 +380,7 @@ export function UnifiedResearchApp() {
             {/* 标题 */}
             <header style={{ marginBottom: 30 }}>
                 <h1 style={{ margin: 0, color: "#1a73e8" }}>🔬 论文研究助手</h1>
-                <p style={{ color: "#666", margin: "4px 0 0" }}>论文搜索 · 代码对齐 · 深度对话</p>
+                <p style={{ color: "#666", margin: "4px 0 0" }}>论文搜索 · 深度对话 · 代码对齐</p>
             </header>
 
             {/* 模块1: 论文搜索 */}
@@ -461,7 +461,137 @@ export function UnifiedResearchApp() {
                 )}
             </section>
 
-            {/* 模块2: 论文-代码对齐 */}
+            {/* 模块2: 深度对话 */}
+            <section style={{ marginBottom: 40 }}>
+                <h2 style={{ color: "#1a73e8", borderBottom: "2px solid #1a73e8", paddingBottom: 8, marginBottom: 16 }}>
+                    💬 深度对话
+                </h2>
+
+                {alignmentReport && (
+                    <div style={{ background: "#e8f0fe", padding: 12, borderRadius: 6, marginBottom: 12, fontSize: 13 }}>
+                        <strong>📚 已加载上下文:</strong> {alignmentReport.paper.title} ({alignmentReport.rows.length} 个声明)
+                        {!customContext && (
+                            <button
+                                onClick={loadAlignmentToChat}
+                                style={{
+                                    marginLeft: 12,
+                                    padding: "4px 12px",
+                                    background: "transparent",
+                                    border: "1px solid #1a73e8",
+                                    color: "#1a73e8",
+                                    borderRadius: 4,
+                                    cursor: "pointer",
+                                    fontSize: 12,
+                                }}
+                            >
+                                加载对齐结果
+                            </button>
+                        )}
+                    </div>
+                )}
+
+                <div style={{ background: "#f8f9fa", borderRadius: 8, padding: 16, minHeight: 400, maxHeight: 500, overflowY: "auto", marginBottom: 12 }}>
+                    {messages.length === 0 && (
+                        <p style={{ color: "#999", textAlign: "center", margin: "40px 0" }}>
+                            开始对话，例如："帮我解释这个论文的核心算法"
+                        </p>
+                    )}
+                    {messages.map((m, idx) => {
+                        const isLastAssistant = m.role === "assistant" && idx === messages.length - 1;
+                        const isStreaming = isLastAssistant && chatLoading;
+                        return (
+                            <div key={m.id} style={{ display: "flex", justifyContent: m.role === "user" ? "flex-end" : "flex-start", marginBottom: 12 }}>
+                                <div style={{
+                                    maxWidth: "75%",
+                                    padding: "10px 14px",
+                                    borderRadius: 12,
+                                    background: m.role === "user" ? "#1a73e8" : "#fff",
+                                    color: m.role === "user" ? "white" : "#333",
+                                    border: m.role === "user" ? "none" : "1px solid #e0e0e0",
+                                    fontSize: 14,
+                                    lineHeight: 1.5,
+                                }}>
+                                    {m.role === "user" ? (
+                                        <div style={{ whiteSpace: "pre-wrap" }}>{m.content}</div>
+                                    ) : isStreaming ? (
+                                        <div style={{ whiteSpace: "pre-wrap" }}>
+                                            {m.content}
+                                            <span style={{ animation: "blink 1s infinite", opacity: 0.5 }}>▊</span>
+                                        </div>
+                                    ) : m.content ? (
+                                        <ReactMarkdown
+                                            remarkPlugins={[remarkGfm, remarkMath]}
+                                            rehypePlugins={[rehypeHighlight, rehypeKatex]}
+                                            components={{
+                                                a: ({ ...props }) => <a {...props} target="_blank" rel="noreferrer" style={{ color: "#1a73e8" }} />,
+                                                code: ({ inline, className, children, ...props }: any) =>
+                                                    inline ? (
+                                                        <code {...props} style={{ background: "#f1f3f4", padding: "2px 5px", borderRadius: 3, fontSize: 13 }}>{children}</code>
+                                                    ) : (
+                                                        <code {...props} className={className} style={{ display: "block", background: "#f6f8fa", padding: 10, borderRadius: 6, overflowX: "auto", fontSize: 13 }}>{children}</code>
+                                                    ),
+                                                pre: ({ ...props }) => <pre {...props} style={{ background: "#f6f8fa", padding: 12, borderRadius: 6, overflowX: "auto", fontSize: 13, margin: "8px 0" }} />,
+                                            }}
+                                        >
+                                            {m.content}
+                                        </ReactMarkdown>
+                                    ) : null}
+                                </div>
+                            </div>
+                        );
+                    })}
+                    {chatLoading && <div style={{ color: "#999", fontStyle: "italic" }}>🤔 思考中...</div>}
+                    <div ref={messagesEndRef} />
+                </div>
+
+                {/* 执行轨迹 Timeline */}
+                {execSteps.length > 0 && (
+                    <ExecTimeline steps={execSteps} />
+                )}
+
+                {/* Human-in-the-loop 确认对话框 */}
+                {pendingConfirm && (
+                    <ConfirmDialog
+                        name={pendingConfirm.name}
+                        args={pendingConfirm.args}
+                        onAllow={() => handleConfirm(true)}
+                        onReject={() => handleConfirm(false)}
+                    />
+                )}
+
+                <div style={{ display: "flex", gap: 8 }}>
+                    <input
+                        value={chatInput}
+                        onChange={(e) => setChatInput(e.target.value)}
+                        onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+                        placeholder="基于论文和代码提问..."
+                        style={{
+                            flex: 1,
+                            padding: "10px 12px",
+                            fontSize: 14,
+                            border: "1px solid #ddd",
+                            borderRadius: 6,
+                        }}
+                        disabled={chatLoading}
+                    />
+                    <button
+                        onClick={sendMessage}
+                        disabled={chatLoading || !chatInput.trim()}
+                        style={{
+                            padding: "10px 20px",
+                            background: chatLoading ? "#ccc" : "#1a73e8",
+                            color: "white",
+                            border: "none",
+                            borderRadius: 6,
+                            cursor: chatLoading ? "not-allowed" : "pointer",
+                        }}
+                    >
+                        发送
+                    </button>
+                </div>
+            </section>
+
+            {/* 模块3: 论文-代码对齐 */}
             <section style={{ marginBottom: 40 }}>
                 <h2 style={{ color: "#1a73e8", borderBottom: "2px solid #1a73e8", paddingBottom: 8, marginBottom: 16 }}>
                     🧩 论文-代码对齐
@@ -628,136 +758,6 @@ export function UnifiedResearchApp() {
                         </div>
                     </div>
                 )}
-            </section>
-
-            {/* 模块3: 深度对话 */}
-            <section>
-                <h2 style={{ color: "#1a73e8", borderBottom: "2px solid #1a73e8", paddingBottom: 8, marginBottom: 16 }}>
-                    💬 深度对话
-                </h2>
-
-                {alignmentReport && (
-                    <div style={{ background: "#e8f0fe", padding: 12, borderRadius: 6, marginBottom: 12, fontSize: 13 }}>
-                        <strong>📚 已加载上下文:</strong> {alignmentReport.paper.title} ({alignmentReport.rows.length} 个声明)
-                        {!customContext && (
-                            <button
-                                onClick={loadAlignmentToChat}
-                                style={{
-                                    marginLeft: 12,
-                                    padding: "4px 12px",
-                                    background: "transparent",
-                                    border: "1px solid #1a73e8",
-                                    color: "#1a73e8",
-                                    borderRadius: 4,
-                                    cursor: "pointer",
-                                    fontSize: 12,
-                                }}
-                            >
-                                加载对齐结果
-                            </button>
-                        )}
-                    </div>
-                )}
-
-                <div style={{ background: "#f8f9fa", borderRadius: 8, padding: 16, minHeight: 400, maxHeight: 500, overflowY: "auto", marginBottom: 12 }}>
-                    {messages.length === 0 && (
-                        <p style={{ color: "#999", textAlign: "center", margin: "40px 0" }}>
-                            开始对话，例如："帮我解释这个论文的核心算法"
-                        </p>
-                    )}
-                    {messages.map((m, idx) => {
-                        const isLastAssistant = m.role === "assistant" && idx === messages.length - 1;
-                        const isStreaming = isLastAssistant && chatLoading;
-                        return (
-                            <div key={m.id} style={{ display: "flex", justifyContent: m.role === "user" ? "flex-end" : "flex-start", marginBottom: 12 }}>
-                                <div style={{
-                                    maxWidth: "75%",
-                                    padding: "10px 14px",
-                                    borderRadius: 12,
-                                    background: m.role === "user" ? "#1a73e8" : "#fff",
-                                    color: m.role === "user" ? "white" : "#333",
-                                    border: m.role === "user" ? "none" : "1px solid #e0e0e0",
-                                    fontSize: 14,
-                                    lineHeight: 1.5,
-                                }}>
-                                    {m.role === "user" ? (
-                                        <div style={{ whiteSpace: "pre-wrap" }}>{m.content}</div>
-                                    ) : isStreaming ? (
-                                        <div style={{ whiteSpace: "pre-wrap" }}>
-                                            {m.content}
-                                            <span style={{ animation: "blink 1s infinite", opacity: 0.5 }}>▊</span>
-                                        </div>
-                                    ) : m.content ? (
-                                        <ReactMarkdown
-                                            remarkPlugins={[remarkGfm, remarkMath]}
-                                            rehypePlugins={[rehypeHighlight, rehypeKatex]}
-                                            components={{
-                                                a: ({ ...props }) => <a {...props} target="_blank" rel="noreferrer" style={{ color: "#1a73e8" }} />,
-                                                code: ({ inline, className, children, ...props }: any) =>
-                                                    inline ? (
-                                                        <code {...props} style={{ background: "#f1f3f4", padding: "2px 5px", borderRadius: 3, fontSize: 13 }}>{children}</code>
-                                                    ) : (
-                                                        <code {...props} className={className} style={{ display: "block", background: "#f6f8fa", padding: 10, borderRadius: 6, overflowX: "auto", fontSize: 13 }}>{children}</code>
-                                                    ),
-                                                pre: ({ ...props }) => <pre {...props} style={{ background: "#f6f8fa", padding: 12, borderRadius: 6, overflowX: "auto", fontSize: 13, margin: "8px 0" }} />,
-                                            }}
-                                        >
-                                            {m.content}
-                                        </ReactMarkdown>
-                                    ) : null}
-                                </div>
-                            </div>
-                        );
-                    })}
-                    {chatLoading && <div style={{ color: "#999", fontStyle: "italic" }}>🤔 思考中...</div>}
-                    <div ref={messagesEndRef} />
-                </div>
-
-                {/* 执行轨迹 Timeline */}
-                {execSteps.length > 0 && (
-                    <ExecTimeline steps={execSteps} />
-                )}
-
-                {/* Human-in-the-loop 确认对话框 */}
-                {pendingConfirm && (
-                    <ConfirmDialog
-                        name={pendingConfirm.name}
-                        args={pendingConfirm.args}
-                        onAllow={() => handleConfirm(true)}
-                        onReject={() => handleConfirm(false)}
-                    />
-                )}
-
-                <div style={{ display: "flex", gap: 8 }}>
-                    <input
-                        value={chatInput}
-                        onChange={(e) => setChatInput(e.target.value)}
-                        onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-                        placeholder="基于论文和代码提问..."
-                        style={{
-                            flex: 1,
-                            padding: "10px 12px",
-                            fontSize: 14,
-                            border: "1px solid #ddd",
-                            borderRadius: 6,
-                        }}
-                        disabled={chatLoading}
-                    />
-                    <button
-                        onClick={sendMessage}
-                        disabled={chatLoading || !chatInput.trim()}
-                        style={{
-                            padding: "10px 20px",
-                            background: chatLoading ? "#ccc" : "#1a73e8",
-                            color: "white",
-                            border: "none",
-                            borderRadius: 6,
-                            cursor: chatLoading ? "not-allowed" : "pointer",
-                        }}
-                    >
-                        发送
-                    </button>
-                </div>
             </section>
 
             {/* 模块4: 知识库 Memory */}
