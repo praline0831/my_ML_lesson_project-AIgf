@@ -15,13 +15,13 @@ export interface ChatMessage {
 export class LLMClient {
     constructor(private config: LLMConfig) { }
 
-    async chat(messages: ChatMessage[], jsonMode: boolean = false): Promise<string> {
+    async chat(messages: ChatMessage[], jsonMode: boolean = false, temperature?: number): Promise<string> {
         const url = `${this.config.endpoint.replace(/\/$/, '')}/chat/completions`;
 
         const body: Record<string, unknown> = {
             model: this.config.model,
             messages,
-            temperature: this.config.temperature ?? 0.2,
+            temperature: temperature ?? this.config.temperature ?? 0.5,
             max_tokens: this.config.maxTokens ?? 8192,
         };
 
@@ -54,8 +54,8 @@ export class LLMClient {
         return content;
     }
 
-    async chatJson<T = unknown>(messages: ChatMessage[]): Promise<T> {
-        const text = await this.chat(messages, true);
+    async chatJson<T = unknown>(messages: ChatMessage[], temperature?: number): Promise<T> {
+        const text = await this.chat(messages, true, temperature);
         return extractJson<T>(text);
     }
 }

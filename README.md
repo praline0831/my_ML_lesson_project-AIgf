@@ -42,7 +42,7 @@
 | **Skills 框架** | Claude 风格的 Skill 注册/激活/指令注入；内置 webSearch / calculator / paperAlign |
 | **论文检索** | arXiv API 集成；多轮 sub-query 生成 |
 | **深度研究** | 多轮迭代检索 → 去重 → 摘要 → 综合；生成结构化研究报告 |
-| **论文-代码对齐** | 两阶段论文解析（组件 → claims）→ 启发式函数排名 → 两遍对齐（逐 claim 检索 + 批量回退）→ 公式级行级证据；对齐结果后自动生成**论文总结**（分核心贡献/支撑组件/实现细节三级展示）；支持**导出为 Markdown 报告** |
+| **论文-代码对齐** | 两阶段论文解析（组件 → claims）→ 角色路由（architecture / training / inference 三种检索策略）→ 算子密集渲染（仅展示含 `torch.*` / `F.*` / `nn.*` 的行）→ 调用链自动展开（0 算子函数 → 回溯 `self.xxx` 调用）→ 算子锚点证据提取；对齐结果后自动生成**论文总结**（分核心贡献/支撑组件/实现细节三级展示）；支持**导出为 Markdown 报告** |
 | **Markdown + LaTeX 渲染** | react-markdown + remark-gfm + remark-math + rehype-katex |
 | **流式接口** | SSE (Server-Sent Events) 实时返回 token、节点轨迹、确认请求、错误 |
 | **本地 LLM** | 通过 Ollama 运行本地模型（gemma4:31b-cloud / kimi-k2.5:cloud） |
@@ -76,11 +76,11 @@
 |  apps/runtime          |   |  @agent/paper-align                |
 |  +-------------------+ |   |  · 两阶段解析 (组件->claims)       |
 |  | LangGraph StateGraph| |   |  · GitHub 仓库抓取 + 启发式排名   |
-|  |                   | |   |  · 两遍对齐 (检索+批量回退)       |
-|  | retrieve (RAG)    | |   |  · 公式级证据 (formulaAlign)      |
-|  |    v              | |   |  · LLM 复用 (LLMProviderAdapter)  |
-|  | think (LLM)       | |   +------------------------------------+
-|  |    v (conditional)| |
+|  |                   | |   |  · 角色路由 (3种检索策略)          |
+|  | retrieve (RAG)    | |   |  · 算子密集渲染 (仅 torch 行)      |
+|  |    v              | |   |  · 调用链展开 (0算子→回溯)       |
+|  | think (LLM)       | |   |  · LLM 复用 (LLMProviderAdapter)  |
+|  |    v (conditional)| |   +------------------------------------+
 |  | +----------+      | |   +------------------------------------+
 |  | | act      |      | |   |  @agent/memory (持久化 RAG)        |
 |  | | (tool)   |      | |   |  · PersistentVectorStore           |
@@ -475,27 +475,48 @@ GitHub repo -> RepoFetcher (文件树 + 候选 .py 文件)
 
 不再使用 LLM 筛选函数（KeyFunctionSelector），改为纯启发式评分，避免昂贵的 LLM 调用和重要函数被误过滤。
 
-**两遍对齐策略**：
+**对齐管线**：
 
 ```
-Pass 1 (逐 claim 精确检索):
-  对每条 claim: 关键词检索 -> 召回 top 5 相关函数 (带完整 body 2500 chars)
-  -> LLM 判断是否匹配 + 置信度 + 推理过程
-  
-Pass 2 (批量回退):
-  对所有 Pass 1 中 missing 的 claim:
-  把所有函数 (top 30) 的简要摘要 (400 chars) 一次性发给 LLM
-  -> 扁平匹配剩余 claims
+每条 claim 独立处理:
+
+  1. 角色路由 (Role Detection)
+     -> 检测 claim 关键词: loss/training → "training" 角色
+                           sample/reverse → "inference" 角色
+                           attention/conv → "architecture" 角色
+     -> 角色决定检索权重: training 角色对 *_step 名称权重 +15
+
+  2. 算子检索 (Operator Retrieval)
+     -> claim 分词 → 检查函数名/路径/签名 + body 关键词 + torch 算子密度
+     -> top 5 候选函数
+
+  3. 类-方法展开 + 调用链展开 (expandWithClass)
+     -> 候选是方法 → 加入父类
+     -> 候选是类 → 加入所有方法
+     -> 候选函数有 0 个 torch 算子 (包装器) → 解析 self.xxx 调用,加入被调者
+
+  4. 算子密集渲染 (Dense Operator Rendering)
+     -> 类: 显示 params(可训练参数) + torch 算子摘要,不显示 body
+     -> 方法: 仅显示包含 torch.* / F.* / nn.* 的行 (带行号 L42),最多 8 行
+     -> 0 算子函数标注 "(no torch ops — wrapper/container)"
+
+  5. LLM 判定 (Per-Claim)
+     -> 温度 0.7, 禁止按名称/docstring 匹配,强制按 torch 算子匹配
+     -> 找不到对应算子 → status:"mismatch" (不强行造假)
+     -> 输出 functionIndex + status + evidence(实际算子)
+
+  6. 算子锚点证据提取 (buildEvidenceSpan)
+     -> 解析 claim 中数学算子 (sqrt, matmul, softmax, ...)
+     -> 在目标函数 body 中搜索含该算子的行
+     -> 截取 [命中行-3, 命中行+3] 作为证据片段
+     -> 无数学算子 → 回退到 torch 密集行
 ```
 
-**公式级证据定位** (formulaAlign)：
+**匹配哲学**：LLM 被训练为编译器/调试器，而非搜索引擎。
+- 旧：根据函数名/类名/docstring 匹配（概念映射）→ 大量假阳性
+- 新：追踪 `torch.*` / `F.*` / `nn.*` 数据流向（算子映射）→ 找不到就是 mismatch
 
-```
-对已匹配的 claim + function:
-  -> 提取公式上下文 (数学符号、变量名)
-  -> LLM 定位函数内的精确行范围
-  -> 生成 EvidenceSpan (startLine, endLine, codeSnippet, formulaContext, variableMappings)
-```
+`mismatch` 不是系统的失败，而是**论文的创新点确实没在开源代码里实现**的信号。
 
 **LLM 容错**：
 
@@ -576,8 +597,8 @@ Chat Agent 通过 `agent.registerTool('align_paper', ...)` 将 PaperAlignAgent �
 ### 6. 两阶段论文解析
 先提取核心组件（3-5 个），再对每个组件提取 claims（2-4 条），避免一次性提取遗漏细节。
 
-### 7. 两遍对齐 + 公式级证据
-第一遍逐 claim 检索精确匹配，第二遍批量回退兜底。匹配后通过 formulaAlign 定位到函数内的精确行范围。
+### 7. 算子映射 + 动态证据
+LLM 被训练为编译器：根据 claim 中的数学算子（sqrt/matmul/softmax）在函数体中搜索对应的 `torch.*` / `F.*` / `nn.*` 调用。找不到则标记 `mismatch`（说明论文创新点未在代码中实现）。证据片段以命中算子行为锚点，截取 ±3 行生成，杜绝 LLM 编造行号。
 
 ### 8. 绝对行号 <-> 相对行号换算
 `CodeViewer` 接收 `lineNumberStart` 映射函数体相对行号为文件绝对行号。
