@@ -36,13 +36,13 @@
 | 模块 | 能力 |
 |------|------|
 | **LangGraph Agent** | StateGraph 状态图编排：`retrieve→think→(act→think)→summarize→END`；ReAct 工具调用；SSE 流式 |
-| **Human-in-the-loop** | 工具调用前弹出确认对话框，展示工具名和参数，用户批准后才执行（30 秒超时自动拒绝） |
+| **Human-in-the-loop** | 工具调用前弹出确认对话框，展示工具名和参数，用户批准后才执行（30 秒超时自动拒绝）；新增**交互式对齐**（`interactive_align`），LLM 自主判断何时需要搜索论文和代码对齐，引导用户完成搜索→选论文→定仓库→对齐全流程 |
 | **Agent 间通信** | Chat Agent 通过 `align_paper` 工具委托 PaperAlign Agent 干活，共享同一 LLM 实例 |
 | **RAG 持久化记忆** | `PersistentVectorStore`（自实现，JSON 持久化）+ 结构化 metadata；自动总结 |
 | **Skills 框架** | Claude 风格的 Skill 注册/激活/指令注入；内置 webSearch / calculator / paperAlign |
 | **论文检索** | arXiv API 集成；多轮 sub-query 生成 |
 | **深度研究** | 多轮迭代检索 → 去重 → 摘要 → 综合；生成结构化研究报告 |
-| **论文-代码对齐** | 两阶段论文解析（组件 → claims）→ 启发式函数排名 → 两遍对齐（逐 claim 检索 + 批量回退）→ 公式级行级证据 |
+| **论文-代码对齐** | 两阶段论文解析（组件 → claims）→ 启发式函数排名 → 两遍对齐（逐 claim 检索 + 批量回退）→ 公式级行级证据；对齐结果后自动生成**论文总结**（分核心贡献/支撑组件/实现细节三级展示）；支持**导出为 Markdown 报告** |
 | **Markdown + LaTeX 渲染** | react-markdown + remark-gfm + remark-math + rehype-katex |
 | **流式接口** | SSE (Server-Sent Events) 实时返回 token、节点轨迹、确认请求、错误 |
 | **本地 LLM** | 通过 Ollama 运行本地模型（gemma4:31b-cloud / kimi-k2.5:cloud） |
@@ -192,7 +192,8 @@ think 节点 -> 条件路由 -> act 节点
 
 - `search_arxiv` -- 搜索论文
 - `deep_research` -- 深度研究
-- `align_paper` -- 论文-代码对齐
+- `align_paper` -- 论文-代码对齐（直接给定 arXiv ID）
+- `interactive_align` -- **交互式论文-代码对齐**（给定论文主题/名称，引导用户完成搜索→选论文→定仓库→对齐）
 - `calculator` -- 数学计算
 
 ---
@@ -338,7 +339,14 @@ GET  /memory/recent         # 最近 50 条
 - 左侧：每条 Claim 卡片（描述 + 状态徽章 + 行号）
 - 右侧：代码查看器（语法高亮、行号重映射、焦点行高亮）
 - 顶部统计：匹配 / 部分 / 偏差 / 缺失
+- **论文总结**：对齐结果下方展示可折叠的论文总结面板，按重要度（核心贡献/支撑组件/实现细节）分条列出声明
+- **导出报告**：支持一键导出为 Markdown (.md) 文件
 - 聊天对齐结果自动同步到此面板
+
+### 交互式对齐
+- **LLM 自主触发**：Agent 识别用户意图（如"帮我对齐LoRA""分析一下Transformer的代码实现"），自主调用 `interactive_align` 工具
+- **引导式流程**：搜索 arXiv → 展示结果（可点击的论文卡片）→ 选择论文 → 自动检测/手动输入 GitHub 仓库 → 执行对齐
+- **执行轨迹同步**：交互式对齐的每一步（搜索 arXiv / 检测仓库 / 代码对齐 / 解析论文 / 提取函数）都注入到聊天区 **Agent 执行轨迹 Timeline** 中，统一可视化
 
 ### 知识库 (RAG Memory)
 - 统计：知识条目总数 / 按来源分布
@@ -365,6 +373,8 @@ Express 服务器，统一对外暴露能力。
 | POST | `/align/run` | 对齐（SSE 流式）|
 | POST | `/align/export` | 导出报告 |
 | GET | `/align/last-result` | 最近一次对齐结果 |
+| POST | `/align/interactive/start` | 交互式对齐（SSE，搜索→选论文→定仓库→对齐）|
+| POST | `/align/interactive/respond` | 交互式对齐用户响应 |
 | GET | `/memory/stats` | 知识库统计 |
 | POST | `/memory/search` | 知识库检索 |
 | GET | `/memory/recent` | 最近条目 |
@@ -571,6 +581,12 @@ Chat Agent 通过 `agent.registerTool('align_paper', ...)` 将 PaperAlignAgent �
 
 ### 8. 绝对行号 <-> 相对行号换算
 `CodeViewer` 接收 `lineNumberStart` 映射函数体相对行号为文件绝对行号。
+
+### 9. 交互式对齐流程
+通过独立的 SSE 端点 `/align/interactive/start` 实现多步引导流程，不依赖 LangGraph 图。架构分为：
+- **会话层**：`InteractiveSession` 管理状态（confirm_search → showing_results → asking_repo → aligning → done）
+- **通信层**：SSE 推送 `ia_ask_confirm` / `ia_show_papers` / `ia_ask_repo` / `ia_node`（注入 Timeline） / `ia_done` 事件
+- **工具层**：Agent 通过 `interactive_align` 工具自主触发，前端自动跳过通用确认对话框，直接启动交互式面板
 
 ---
 

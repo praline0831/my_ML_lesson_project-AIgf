@@ -130,6 +130,16 @@ export function UnifiedResearchApp() {
     } | null>(null);
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
+    // 交互式对齐
+    const [iaSession, setIaSession] = useState<string | null>(null);
+    const [iaStep, setIaStep] = useState<string>('');
+    const [iaTopic, setIaTopic] = useState('');
+    const [iaPapers, setIaPapers] = useState<ArxivPaper[]>([]);
+    const [iaMessages, setIaMessages] = useState<string[]>([]);
+    const [iaRepoUrl, setIaRepoUrl] = useState('');
+    const [iaLoading, setIaLoading] = useState(false);
+    const iaEventSourceRef = useRef<EventSource | null>(null);
+
     const scrollToBottom = () => {
         messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     };
@@ -297,11 +307,27 @@ export function UnifiedResearchApp() {
                             };
                             setExecSteps((prev) => [...prev, step]);
                         } else if (payload.type === "confirm") {
-                            setPendingConfirm({
-                                id: payload.id,
-                                name: payload.name,
-                                args: payload.args,
-                            });
+                            // 交互式对齐 → 自动确认 + 启动交互面板
+                            if (payload.name === 'interactive_align') {
+                                const topic = typeof payload.args?.topic === 'string' ? payload.args.topic : '';
+                                fetch(`${API_BASE}/chat/confirm`, {
+                                    method: "POST",
+                                    headers: { "Content-Type": "application/json" },
+                                    body: JSON.stringify({ id: payload.id, decision: true }),
+                                }).catch(() => {});
+                                setExecSteps((prev) => [...prev, {
+                                    id: stepCounter++, node: "interactive_align",
+                                    trace: `启动交互式对齐: ${topic || '未知主题'}`,
+                                    time: Date.now(),
+                                }]);
+                                if (topic) startInteractiveAlign(topic);
+                            } else {
+                                setPendingConfirm({
+                                    id: payload.id,
+                                    name: payload.name,
+                                    args: payload.args,
+                                });
+                            }
                         } else if (payload.type === "done") {
                             // chat 完成 → 检查是否有新的对齐报告供对齐模块展示
                             fetch(`${API_BASE}/align/last-result`)
@@ -348,6 +374,150 @@ export function UnifiedResearchApp() {
             console.error("Confirm failed:", e);
         }
         setPendingConfirm(null);
+    };
+
+    // ───────────── 交互式对齐 ─────────────
+
+    const startInteractiveAlign = async (topic?: string) => {
+        const query = (topic || chatInput.trim() || "").replace(/^(帮我对齐|帮我|对齐|align|search|搜索)/i, '').trim();
+        if (!query) return;
+
+        setIaSession(null);
+        setIaStep('starting');
+        setIaTopic(query);
+        setIaPapers([]);
+        setIaMessages(['正在启动交互式对齐...']);
+        setIaLoading(true);
+
+        try {
+            const res = await fetch(`${API_BASE}/align/interactive/start`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ topic: query }),
+            });
+            if (!res.body) throw new Error("无响应流");
+
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = "";
+            let iaStepCounter = 0;
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+
+                const events = buffer.split("\n\n");
+                buffer = events.pop() ?? "";
+
+                for (const evt of events) {
+                    if (!evt.startsWith("data: ")) continue;
+                    try {
+                        const payload = JSON.parse(evt.slice(6));
+                        const sessionId = payload.sessionId;
+                        if (sessionId) setIaSession(sessionId);
+
+                        // ia_node → 注入到执行轨迹
+                        if (payload.type === "ia_node") {
+                            const step: ExecStep = {
+                                id: iaStepCounter++,
+                                node: payload.name || "unknown",
+                                trace: payload.trace || "",
+                                time: Date.now(),
+                            };
+                            setExecSteps((prev) => [...prev, step]);
+                        }
+
+                        switch (payload.type) {
+                            case "ia_ask_confirm":
+                                setIaStep('confirm_search');
+                                setIaMessages([`是否搜索 arXiv 上关于「${payload.topic}」的论文？`]);
+                                setIaLoading(false);
+                                break;
+                            case "ia_progress":
+                                setIaMessages(prev => [...prev, payload.message]);
+                                setIaStep('progress');
+                                break;
+                            case "ia_show_papers":
+                                setIaStep('showing_results');
+                                setIaPapers(payload.papers || []);
+                                setIaMessages([`搜索到 ${(payload.papers || []).length} 篇论文，请选择要对齐的论文：`]);
+                                setIaLoading(false);
+                                break;
+                            case "ia_found_repo":
+                                setIaMessages(prev => [...prev, `自动检测到 GitHub 仓库: ${payload.repoUrl}`]);
+                                break;
+                            case "ia_ask_repo":
+                                setIaStep('asking_repo');
+                                setIaRepoUrl('');
+                                setIaMessages([`未检测到 GitHub 仓库，请手动输入「${payload.paperTitle}」的仓库地址：`]);
+                                setIaLoading(false);
+                                break;
+                            case "ia_done":
+                                setIaStep('done');
+                                setAlignmentReport(payload.report);
+                                if (payload.report?.paper?.arxivId) {
+                                    setArxivIdInput(payload.report.paper.arxivId);
+                                }
+                                setIaMessages(prev => [...prev, `✅ 对齐完成！共 ${payload.report?.summary?.total || 0} 个声明，匹配率 ${payload.report?.summary ? ((payload.report.summary.matched + payload.report.summary.partial) / payload.report.summary.total * 100).toFixed(0) : '?'}%`]);
+                                setIaLoading(false);
+                                break;
+                            case "ia_error":
+                                setIaMessages(prev => [...prev, `❌ ${payload.message}`]);
+                                setIaLoading(false);
+                                break;
+                            case "ia_cancelled":
+                                setIaStep('cancelled');
+                                setIaMessages(prev => [...prev, '已取消']);
+                                setIaLoading(false);
+                                break;
+                        }
+                    } catch (e) {
+                        console.error("Parse IA event error:", e);
+                    }
+                }
+            }
+        } catch (e) {
+            setIaMessages(prev => [...prev, `❌ 错误: ${e instanceof Error ? e.message : String(e)}`]);
+            setIaLoading(false);
+        }
+    };
+
+    const respondInteractiveAlign = async (action: string, value?: unknown) => {
+        if (!iaSession) return;
+        setIaLoading(true);
+        setIaMessages(prev => [...prev, action === 'confirm_search' ? '✅ 确认搜索' : action === 'cancel' ? '⏹️ 取消' : '']);
+        try {
+            const res = await fetch(`${API_BASE}/align/interactive/respond`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ sessionId: iaSession, action, value }),
+            });
+            const data = await res.json();
+            if (!data.ok) {
+                setIaMessages(prev => [...prev, `❌ 响应失败: ${data.error || 'unknown'}`]);
+            }
+        } catch (e) {
+            setIaMessages(prev => [...prev, `❌ 响应错误: ${e instanceof Error ? e.message : String(e)}`]);
+        } finally {
+            setIaLoading(false);
+        }
+    };
+
+    const cancelInteractiveAlign = () => {
+        respondInteractiveAlign('cancel');
+        setIaStep('cancelled');
+    };
+
+    const submitRepoUrl = () => {
+        const url = iaRepoUrl.trim();
+        if (!url) return;
+        respondInteractiveAlign('input_repo', url);
+    };
+
+    const selectPaper = (paper: ArxivPaper) => {
+        const arxivId = paper.id.replace("http://arxiv.org/abs/", "").replace("https://arxiv.org/abs/", "");
+        respondInteractiveAlign('select_paper', arxivId);
     };
 
     const buildContextMessage = () => {
@@ -559,12 +729,31 @@ export function UnifiedResearchApp() {
                     />
                 )}
 
+                {/* 交互式对齐面板 */}
+                {iaSession && iaStep !== 'done' && iaStep !== 'cancelled' && iaStep !== '' && (
+                    <InteractiveAlignPanel
+                        step={iaStep}
+                        topic={iaTopic}
+                        papers={iaPapers}
+                        messages={iaMessages}
+                        loading={iaLoading}
+                        repoUrl={iaRepoUrl}
+                        onRepoUrlChange={setIaRepoUrl}
+                        onConfirmSearch={() => respondInteractiveAlign('confirm_search')}
+                        onSelectPaper={selectPaper}
+                        onSubmitRepo={submitRepoUrl}
+                        onCancel={cancelInteractiveAlign}
+                    />
+                )}
+
                 <div style={{ display: "flex", gap: 8 }}>
                     <input
                         value={chatInput}
                         onChange={(e) => setChatInput(e.target.value)}
-                        onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-                        placeholder="基于论文和代码提问..."
+                        onKeyDown={(e) => {
+                            if (e.key === "Enter" && !chatLoading) sendMessage();
+                        }}
+                        placeholder="输入消息，AI 会自动判断是否需要搜索论文和代码对齐..."
                         style={{
                             flex: 1,
                             padding: "10px 12px",
@@ -572,7 +761,7 @@ export function UnifiedResearchApp() {
                             border: "1px solid #ddd",
                             borderRadius: 6,
                         }}
-                        disabled={chatLoading}
+                        disabled={chatLoading || iaLoading}
                     />
                     <button
                         onClick={sendMessage}
@@ -587,6 +776,24 @@ export function UnifiedResearchApp() {
                         }}
                     >
                         发送
+                    </button>
+                    <button
+                        onClick={() => startInteractiveAlign()}
+                        disabled={chatLoading || iaLoading || !chatInput.trim()}
+                        title="启动交互式对齐"
+                        style={{
+                            padding: "10px 14px",
+                            background: "#34a853",
+                            color: "white",
+                            border: "none",
+                            borderRadius: 6,
+                            cursor: chatLoading || iaLoading || !chatInput.trim() ? "not-allowed" : "pointer",
+                            fontSize: 13,
+                            fontWeight: 600,
+                            whiteSpace: "nowrap",
+                        }}
+                    >
+                        🧩 对齐
                     </button>
                 </div>
             </section>
@@ -669,22 +876,53 @@ export function UnifiedResearchApp() {
                                 {alignmentReport.repo && <> · 🔗 <a href={alignmentReport.repo.url} target="_blank" rel="noreferrer">{alignmentReport.repo.owner}/{alignmentReport.repo.repo}</a></>}
                             </p>
                             <SummaryBadges summary={alignmentReport.summary} />
-                            <button
-                                onClick={loadAlignmentToChat}
-                                style={{
-                                    marginTop: 12,
-                                    padding: "8px 16px",
-                                    background: "#34a853",
-                                    color: "white",
-                                    border: "none",
-                                    borderRadius: 6,
-                                    cursor: "pointer",
-                                    fontSize: 13,
-                                    fontWeight: 500,
-                                }}
-                            >
-                                💬 加载到对话上下文 →
-                            </button>
+                            <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
+                                <button
+                                    onClick={loadAlignmentToChat}
+                                    style={{
+                                        padding: "8px 16px",
+                                        background: "#34a853",
+                                        color: "white",
+                                        border: "none",
+                                        borderRadius: 6,
+                                        cursor: "pointer",
+                                        fontSize: 13,
+                                        fontWeight: 500,
+                                    }}
+                                >
+                                    💬 加载到对话上下文 →
+                                </button>
+                                <button
+                                    onClick={() => {
+                                        fetch(`${API_BASE}/align/export`, {
+                                            method: "POST",
+                                            headers: { "Content-Type": "application/json" },
+                                            body: JSON.stringify({ markdown: alignmentReport.markdown, arxiv_id: alignmentReport.paper.arxivId }),
+                                        })
+                                            .then(res => res.blob())
+                                            .then(blob => {
+                                                const url = URL.createObjectURL(blob);
+                                                const a = document.createElement("a");
+                                                a.href = url;
+                                                a.download = `align-${alignmentReport.paper.arxivId}-${Date.now()}.md`;
+                                                a.click();
+                                                URL.revokeObjectURL(url);
+                                            });
+                                    }}
+                                    style={{
+                                        padding: "8px 16px",
+                                        background: "white",
+                                        color: "#1a73e8",
+                                        border: "1px solid #1a73e8",
+                                        borderRadius: 6,
+                                        cursor: "pointer",
+                                        fontSize: 13,
+                                        fontWeight: 500,
+                                    }}
+                                >
+                                    📥 导出报告 (.md)
+                                </button>
+                            </div>
                         </div>
 
                         <div style={{ display: "grid", gridTemplateColumns: "minmax(380px, 1fr) minmax(0, 1.4fr)", gap: 12, minHeight: 600 }}>
@@ -756,6 +994,9 @@ export function UnifiedResearchApp() {
                                 )}
                             </div>
                         </div>
+
+                        {/* 论文总结 */}
+                        <PaperSummary rows={alignmentReport.rows} />
                     </div>
                 )}
             </section>
@@ -970,6 +1211,15 @@ const NODE_META: Record<string, { icon: string; label: string; color: string }> 
     act: { icon: "🔧", label: "工具", color: "#e37400" },
     invoke_skill: { icon: "🎯", label: "Skill", color: "#0d652d" },
     summarize: { icon: "📝", label: "总结", color: "#5f6368" },
+    // 交互式对齐节点
+    interactive_align: { icon: "🧩", label: "交互对齐", color: "#34a853" },
+    search_arxiv: { icon: "📄", label: "搜索 arXiv", color: "#1a73e8" },
+    detect_repo: { icon: "🔗", label: "检测仓库", color: "#34a853" },
+    align_paper: { icon: "🧩", label: "代码对齐", color: "#f9ab00" },
+    paper: { icon: "📑", label: "解析论文", color: "#7b1fa2" },
+    repo: { icon: "📂", label: "获取仓库", color: "#34a853" },
+    functions: { icon: "🔧", label: "提取函数", color: "#e37400" },
+    align: { icon: "🎯", label: "逐条对齐", color: "#c62828" },
 };
 
 function ExecTimeline({ steps }: { steps: ExecStep[] }) {
@@ -1025,6 +1275,165 @@ function ExecTimeline({ steps }: { steps: ExecStep[] }) {
         </div>
     );
 }
+
+/** 论文总结组件：按重要度分条展示论文核心声明 */
+function PaperSummary({ rows }: { rows: AlignmentReport["rows"] }) {
+    const [collapsed, setCollapsed] = useState(true);
+    const coreClaims = rows.filter(r => (r.claim.importance ?? 2) === 1);
+    const supportClaims = rows.filter(r => (r.claim.importance ?? 2) === 2);
+    const detailClaims = rows.filter(r => (r.claim.importance ?? 2) === 3);
+
+    return (
+        <div style={{ marginTop: 16, background: "white", border: "1px solid #e0e0e0", borderRadius: 8 }}>
+            <div
+                onClick={() => setCollapsed(!collapsed)}
+                style={{
+                    padding: "12px 16px",
+                    cursor: "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    userSelect: "none",
+                    borderBottom: collapsed ? "none" : "1px solid #e0e0e0",
+                }}
+            >
+                <span style={{ fontSize: 14, color: "#666" }}>{collapsed ? "▶" : "▼"}</span>
+                <span style={{ fontSize: 15, fontWeight: 600, color: "#202124" }}>📝 论文总结</span>
+                <span style={{ fontSize: 12, color: "#999" }}>{rows.length} 个声明</span>
+            </div>
+            {!collapsed && (
+                <div style={{ padding: "8px 16px 16px" }}>
+                    {coreClaims.length > 0 && (
+                        <div style={{ marginBottom: 12 }}>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: "#c62828", marginBottom: 6 }}>🔴 核心贡献</div>
+                            {coreClaims.map((r, i) => (
+                                <div key={i} style={{ fontSize: 13, color: "#333", padding: "3px 0 3px 16px", lineHeight: 1.5 }}>
+                                  • {r.claim.description}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                    {supportClaims.length > 0 && (
+                        <div style={{ marginBottom: 12 }}>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: "#f9a825", marginBottom: 6 }}>🟡 支撑组件</div>
+                            {supportClaims.map((r, i) => (
+                                <div key={i} style={{ fontSize: 13, color: "#333", padding: "3px 0 3px 16px", lineHeight: 1.5 }}>
+                                  • {r.claim.description}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                    {detailClaims.length > 0 && (
+                        <div>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: "#1565c0", marginBottom: 6 }}>🔵 实现细节</div>
+                            {detailClaims.map((r, i) => (
+                                <div key={i} style={{ fontSize: 13, color: "#333", padding: "3px 0 3px 16px", lineHeight: 1.5 }}>
+                                  • {r.claim.description}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            )}
+        </div>
+    );
+}
+
+/** 交互式对齐面板 */
+function InteractiveAlignPanel({
+    step, topic, papers, messages, loading, repoUrl,
+    onRepoUrlChange, onConfirmSearch, onSelectPaper, onSubmitRepo, onCancel,
+}: {
+    step: string; topic: string; papers: ArxivPaper[]; messages: string[]; loading: boolean;
+    repoUrl: string; onRepoUrlChange: (v: string) => void;
+    onConfirmSearch: () => void; onSelectPaper: (p: ArxivPaper) => void;
+    onSubmitRepo: () => void; onCancel: () => void;
+}) {
+    return (
+        <div style={{ margin: "12px 0", background: "white", border: "2px solid #34a853", borderRadius: 12, padding: 16 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+                <span style={{ fontSize: 18 }}>🧩</span>
+                <span style={{ fontWeight: 600, fontSize: 15, color: "#202124" }}>交互式对齐</span>
+                <span style={{ fontSize: 12, color: "#999" }}>主题: {topic}</span>
+                {loading && <span style={{ fontSize: 12, color: "#34a853", marginLeft: "auto" }}>⏳ 处理中...</span>}
+            </div>
+
+            {/* 消息列表 */}
+            {messages.map((msg, i) => (
+                <div key={i} style={{ fontSize: 13, color: "#333", marginBottom: 6, lineHeight: 1.5 }}>{msg}</div>
+            ))}
+
+            {/* 确认搜索 */}
+            {step === 'confirm_search' && !loading && (
+                <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                    <button onClick={onConfirmSearch} style={iaBtnStyle("#34a853")}>✅ 搜索 arXiv</button>
+                    <button onClick={onCancel} style={iaBtnStyle("#a50e0e")}>❌ 取消</button>
+                </div>
+            )}
+
+            {/* 搜索结果 */}
+            {step === 'showing_results' && papers.length > 0 && (
+                <div style={{ marginTop: 8, maxHeight: 300, overflowY: "auto" }}>
+                    {papers.map((paper, i) => (
+                        <div
+                            key={paper.id}
+                            onClick={() => onSelectPaper(paper)}
+                            style={{
+                                padding: "10px 12px",
+                                border: "1px solid #e0e0e0",
+                                borderRadius: 8,
+                                marginBottom: 8,
+                                cursor: "pointer",
+                                background: "white",
+                                transition: "box-shadow 0.15s",
+                            }}
+                            onMouseEnter={e => (e.currentTarget.style.boxShadow = "0 2px 8px rgba(0,0,0,0.1)")}
+                            onMouseLeave={e => (e.currentTarget.style.boxShadow = "none")}
+                        >
+                            <div style={{ fontSize: 13, fontWeight: 600, color: "#1a73e8", marginBottom: 4 }}>{paper.title}</div>
+                            <div style={{ fontSize: 11, color: "#666" }}>
+                                👤 {paper.authors.slice(0, 3).join(", ")}{paper.authors.length > 3 ? " et al." : ""} · 📅 {paper.published?.slice(0, 10)}
+                            </div>
+                            <div style={{ fontSize: 12, color: "#5f6368", marginTop: 4, lineHeight: 1.4, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
+                                {paper.abstract?.slice(0, 200)}{paper.abstract && paper.abstract.length > 200 ? "..." : ""}
+                            </div>
+                            <div style={{ fontSize: 11, color: "#34a853", marginTop: 4 }}>👆 点击选择此论文</div>
+                        </div>
+                    ))}
+                </div>
+            )}
+
+            {/* 手动输入仓库 */}
+            {step === 'asking_repo' && !loading && (
+                <div style={{ marginTop: 8, display: "flex", gap: 8 }}>
+                    <input
+                        value={repoUrl}
+                        onChange={e => onRepoUrlChange(e.target.value)}
+                        placeholder="https://github.com/owner/repo"
+                        style={{
+                            flex: 1, padding: "8px 12px", fontSize: 13,
+                            border: "1px solid #ddd", borderRadius: 6,
+                        }}
+                        onKeyDown={e => e.key === "Enter" && onSubmitRepo()}
+                    />
+                    <button onClick={onSubmitRepo} disabled={!repoUrl.trim()} style={iaBtnStyle("#1a73e8")}>确定</button>
+                    <button onClick={onCancel} style={iaBtnStyle("#a50e0e")}>取消</button>
+                </div>
+            )}
+        </div>
+    );
+}
+
+const iaBtnStyle = (color: string): React.CSSProperties => ({
+    padding: "8px 16px",
+    background: color,
+    color: "white",
+    border: "none",
+    borderRadius: 6,
+    cursor: "pointer",
+    fontSize: 13,
+    fontWeight: 500,
+});
 
 function SummaryBadges({ summary }: { summary: AlignmentReport["summary"] }) {
     const items: { key: AlignStatus; count: number }[] = [

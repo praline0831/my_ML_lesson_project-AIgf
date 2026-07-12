@@ -187,5 +187,41 @@ function renderMarkdown(
         lines.push('');
     }
 
+    lines.push('## 论文总结');
+    lines.push('');
+
+    const coreComponents = input.components.filter(c => c.component.priority === 1);
+    const supportComponents = input.components.filter(c => c.component.priority === 2);
+    const detailComponents = input.components.filter(c => c.component.priority === 3);
+
+    if (coreComponents.length > 0) {
+        lines.push('### 🔴 核心贡献');
+        for (const { component, rows } of coreComponents) {
+            lines.push(`- **${component.name}**: ${component.description}`);
+            for (const row of rows) {
+                const icon = STATUS_ICON[row.status];
+                lines.push(`  - ${icon} ${row.claim.description}`);
+            }
+        }
+        lines.push('');
+    }
+
+    if (supportComponents.length > 0) {
+        lines.push('### 🟡 支撑组件');
+        for (const { component } of supportComponents) {
+            lines.push(`- **${component.name}**: ${component.description}`);
+        }
+        lines.push('');
+    }
+
+    if (detailComponents.length > 0) {
+        lines.push('### 🔵 实现细节');
+        for (const { component } of detailComponents) {
+            const claimList = component.claims.map(c => c.description).join('; ');
+            lines.push(`- **${component.name}**: ${claimList}`);
+        }
+        lines.push('');
+    }
+
     return lines.join('\n');
 }

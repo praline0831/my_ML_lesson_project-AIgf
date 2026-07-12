@@ -1,12 +1,59 @@
 import { Agent, ConfirmRequest, createAgent, paperTools } from "@agent/runtime";
 import { arxivService, deepResearchService, generateAnalysisDoc, generateResearchReport, generateSearchResultDoc } from "@agent/paper";
-import { LLMProviderAdapter, PaperAlignAgent } from "@agent/paper-align";
+import { LLMProviderAdapter, PaperAlignAgent, extractRepoUrl } from "@agent/paper-align";
 import cors from "cors";
 import express from "express";
 import { existsSync, mkdirSync, writeFileSync } from "fs";
 import { createServer } from "http";
 import { join } from "path";
 import { WebSocketServer } from "ws";
+
+// ── 交互式对齐会话 ──
+interface InteractiveSession {
+    id: string;
+    topic: string;
+    step: 'confirm_search' | 'showing_results' | 'asking_repo' | 'aligning' | 'done' | 'cancelled';
+    papers?: { id: string; title: string; authors: string[]; abstract: string; published: string; pdfUrl: string }[];
+    selectedPaper?: { id: string; title: string };
+    repoUrl?: string;
+    report?: import("@agent/paper-align").AlignmentReport;
+    error?: string;
+    /** 用于 SSE 推送的响应对象 */
+    res?: express.Response;
+}
+
+const interactiveSessions = new Map<string, InteractiveSession>();
+
+function createInteractiveSession(topic: string, res: express.Response): InteractiveSession {
+    const session: InteractiveSession = {
+        id: crypto.randomUUID(),
+        topic,
+        step: 'confirm_search',
+        res,
+    };
+    interactiveSessions.set(session.id, session);
+    // 30分钟超时清理
+    setTimeout(() => {
+        const s = interactiveSessions.get(session.id);
+        if (s && (s.step === 'confirm_search' || s.step === 'showing_results' || s.step === 'asking_repo')) {
+            s.step = 'cancelled';
+            pushEvent(s, { type: 'ia_cancelled', reason: 'timeout' });
+            interactiveSessions.delete(session.id);
+        }
+    }, 30 * 60 * 1000);
+    return session;
+}
+
+function pushEvent(session: InteractiveSession, data: Record<string, unknown>): void {
+    if (session.res) {
+        session.res.write(`data: ${JSON.stringify({ sessionId: session.id, ...data })}\n\n`);
+    }
+}
+
+/** 交互式对话中的 ArXiv 搜索结果 */
+interface ArxivSearchResult {
+    id: string; title: string; authors: string[]; abstract: string; published: string; pdfUrl: string;
+}
 
 const app = express();
 app.use(cors({ origin: true }));
@@ -115,6 +162,24 @@ agent.addToolDescription(
   '然后在 GitHub 仓库中找到对应的代码实现，逐条分析对齐程度（完全匹配/部分匹配/偏差/缺失）。' +
   '参数：arxiv_id（必填，如 "2106.09685"），repo_url（可选，GitHub 仓库地址）。' +
   '返回结构化对齐报告，包含每个声明的匹配结果、对应代码文件和行号。',
+);
+
+// ── 交互式对齐工具（供 AI agent 自主触发） ──
+agent.registerTool('interactive_align', async (args) => {
+  const topic = args.topic as string;
+  if (!topic || typeof topic !== 'string') {
+    throw new Error('请提供论文主题（如 "LoRA"）');
+  }
+  // 实际工作由前端的交互式对齐面板完成
+  // 工具仅返回占位消息，交互流程结束后 report 通过 SSE 推回
+  return `🧩 已启动交互式对齐，主题：「${topic}」。请在前端面板中完成搜索、选论文、定仓库等步骤。`;
+});
+agent.addToolDescription(
+  'interactive_align',
+  '交互式论文-代码对齐。当用户想将某篇论文与其开源代码进行对比分析时，使用此工具。' +
+  '它会先搜索 arXiv 相关论文，让用户选择具体论文，再自动检测或手动输入 GitHub 仓库，最终生成逐声明的对齐报告。' +
+  '参数：topic（必填，论文主题或名称，如 "LoRA"、"Transformer"、"Diffusion Model"）。' +
+  '注意：此工具适合用户提供论文名称或主题而非具体 ArXiv ID 的场景。',
 );
 
 /** 健康检查 */
@@ -540,6 +605,201 @@ app.post("/align/export", async (req, res) => {
     });
   }
 });
+
+/** 交互式对齐：开始新会话（SSE） */
+app.post("/align/interactive/start", async (req, res) => {
+    try {
+        const { topic } = req.body ?? {};
+        if (!topic || typeof topic !== "string" || !topic.trim()) {
+            res.status(400).json({ error: "缺少 topic 参数" });
+            return;
+        }
+
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+        res.setHeader("X-Accel-Buffering", "no");
+        res.flushHeaders();
+
+        const session = createInteractiveSession(topic.trim(), res);
+
+        // Step 1: 询问用户是否搜索
+        pushEvent(session, { type: "ia_ask_confirm", topic: session.topic });
+
+        // 等待用户响应（通过 /align/interactive/respond）
+        // 这里不 await，让 SSE 连接保持
+    } catch (err) {
+        console.error("[Gateway] /align/interactive/start 错误:", err);
+        res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+});
+
+/** 交互式对齐：用户响应 */
+app.post("/align/interactive/respond", async (req, res) => {
+    try {
+        const { sessionId, action, value } = req.body ?? {};
+        if (!sessionId || typeof sessionId !== "string") {
+            res.status(400).json({ error: "缺少 sessionId" });
+            return;
+        }
+        if (!action || typeof action !== "string") {
+            res.status(400).json({ error: "缺少 action" });
+            return;
+        }
+
+        const session = interactiveSessions.get(sessionId);
+        if (!session) {
+            res.status(404).json({ error: "会话不存在或已过期" });
+            return;
+        }
+
+        switch (action) {
+            case "confirm_search": {
+                // 用户确认搜索 → 执行 arXiv 搜索
+                session.step = 'showing_results';
+                pushEvent(session, { type: "ia_node", name: "search_arxiv", trace: `正在搜索 arXiv 上的「${session.topic}」...` });
+                pushEvent(session, { type: "ia_progress", message: `正在搜索 arXiv 上的「${session.topic}」...` });
+
+                const maxResults = typeof value === "number" ? value : 10;
+                const searchResult = await arxivService.search(session.topic, maxResults);
+                const papers: ArxivSearchResult[] = searchResult.papers.map(p => ({
+                    id: p.id.replace(/^https?:\/\/arxiv\.org\/(abs|pdf)\//, '').replace(/v\d+$/, ''),
+                    title: p.title,
+                    authors: p.authors.slice(0, 5),
+                    abstract: p.abstract.slice(0, 500) + (p.abstract.length > 500 ? '...' : ''),
+                    published: p.published,
+                    pdfUrl: p.pdfUrl,
+                }));
+                session.papers = papers;
+                pushEvent(session, { type: "ia_show_papers", papers, query: session.topic });
+                break;
+            }
+
+            case "select_paper": {
+                // 用户选择了一篇论文
+                const paperId = typeof value === "string" ? value : "";
+                const paper = session.papers?.find(p => p.id === paperId);
+                if (!paper) {
+                    pushEvent(session, { type: "ia_error", message: `未找到论文 ${paperId}` });
+                    res.json({ ok: false, error: "论文不存在" });
+                    return;
+                }
+                session.selectedPaper = { id: paper.id, title: paper.title };
+                session.step = 'asking_repo';
+                pushEvent(session, { type: "ia_node", name: "detect_repo", trace: `检测「${paper.title}」的 GitHub 仓库...` });
+                pushEvent(session, { type: "ia_progress", message: `已选择论文: ${paper.title}` });
+
+                // 自动检测 GitHub 仓库
+                const sharedProvider = agent.getLLMProvider();
+                const alignAgent = new PaperAlignAgent({
+                    llm: new LLMProviderAdapter(sharedProvider),
+                    githubToken: process.env.GITHUB_TOKEN,
+                    proxyUrl: process.env.HTTPS_PROXY || process.env.HTTP_PROXY,
+                    onProgress: (stage, info) => {
+                        pushEvent(session, { type: "ia_node", name: stage, trace: info || '' });
+                    },
+                });
+                const searchMeta = await arxivService.search(paperId, 1).catch(() => null);
+                const paperInfo = searchMeta?.papers?.[0];
+                const detectedRepo = paperInfo ? extractRepoUrl(`${paperInfo.abstract}\n${paperInfo.comment || ''}`) : undefined;
+
+                if (detectedRepo) {
+                    session.repoUrl = detectedRepo;
+                    session.step = 'aligning';
+                    pushEvent(session, { type: "ia_found_repo", repoUrl: detectedRepo });
+                    // 自动开始对齐
+                    runAlignment(session, alignAgent).catch(err => {
+                        pushEvent(session, { type: "ia_error", message: err instanceof Error ? err.message : String(err) });
+                    });
+                } else {
+                    pushEvent(session, { type: "ia_ask_repo", paperTitle: paper.title });
+                }
+                break;
+            }
+
+            case "input_repo": {
+                // 用户手动输入了 GitHub 仓库
+                const repoUrl = typeof value === "string" ? value.trim() : "";
+                if (!repoUrl || !repoUrl.includes('github.com')) {
+                    pushEvent(session, { type: "ia_error", message: "请输入有效的 GitHub 仓库地址" });
+                    res.json({ ok: false, error: "无效的仓库地址" });
+                    return;
+                }
+                session.repoUrl = repoUrl;
+                session.step = 'aligning';
+                pushEvent(session, { type: "ia_node", name: "align_paper", trace: `开始对齐论文代码，仓库: ${repoUrl}` });
+                pushEvent(session, { type: "ia_progress", message: `使用仓库: ${repoUrl}` });
+
+                const sharedProvider = agent.getLLMProvider();
+                const alignAgent = new PaperAlignAgent({
+                    llm: new LLMProviderAdapter(sharedProvider),
+                    githubToken: process.env.GITHUB_TOKEN,
+                    proxyUrl: process.env.HTTPS_PROXY || process.env.HTTP_PROXY,
+                    onProgress: (stage, info) => {
+                        pushEvent(session, { type: "ia_progress", message: `[${stage}] ${info}` });
+                    },
+                });
+                runAlignment(session, alignAgent, repoUrl).catch(err => {
+                    pushEvent(session, { type: "ia_error", message: err instanceof Error ? err.message : String(err) });
+                });
+                break;
+            }
+
+            case "cancel": {
+                session.step = 'cancelled';
+                pushEvent(session, { type: "ia_cancelled", reason: "user cancelled" });
+                interactiveSessions.delete(sessionId);
+                break;
+            }
+
+            default:
+                res.status(400).json({ error: `未知动作: ${action}` });
+                return;
+        }
+
+        res.json({ ok: true, sessionId });
+    } catch (err) {
+        console.error("[Gateway] /align/interactive/respond 错误:", err);
+        res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+});
+
+async function runAlignment(session: InteractiveSession, alignAgent: PaperAlignAgent, explicitRepoUrl?: string) {
+    if (!session.selectedPaper) {
+        pushEvent(session, { type: "ia_error", message: "未选择论文" });
+        return;
+    }
+    const id = session.selectedPaper.id;
+    pushEvent(session, { type: "ia_node", name: "align_paper", trace: `解析论文 ${id} ...` });
+    pushEvent(session, { type: "ia_progress", message: "开始论文-代码对齐..." });
+
+    const report = await alignAgent.align(id, explicitRepoUrl || session.repoUrl);
+
+    session.report = report;
+    session.step = 'done';
+
+    // 注入记忆
+    const memory = agent.getMemory();
+    if (memory && report.rows.length > 0) {
+        try {
+            await memory.longTerm.addSummary(
+                report.paper.title,
+                `Aligned ${report.rows.length} claims: ${report.summary.matched} match, ${report.summary.partial} partial, ${report.summary.mismatch} mismatch, ${report.summary.missing} missing`,
+                [report.paper.title],
+            );
+            await memory.save();
+        } catch (e) {
+            console.error('[Memory injection error]', e);
+        }
+    }
+
+    pushEvent(session, { type: "ia_done", report });
+    // 也设置最近一次对齐报告
+    lastAlignReport = report;
+
+    // 清理会话
+    setTimeout(() => interactiveSessions.delete(session.id), 60_000);
+}
 
 /**
  * 返回最近一次对齐报告（供前端对齐模块 UI 渲染）

@@ -308,6 +308,38 @@ function AlignResult({
                         })}
                     </div>
                 )}
+                <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
+                    <button
+                        onClick={() => {
+                            fetch(`${API_BASE}/align/export`, {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({ markdown: report.markdown, arxiv_id: report.paper.arxivId }),
+                            })
+                                .then(res => res.blob())
+                                .then(blob => {
+                                    const url = URL.createObjectURL(blob);
+                                    const a = document.createElement("a");
+                                    a.href = url;
+                                    a.download = `align-${report.paper.arxivId}-${Date.now()}.md`;
+                                    a.click();
+                                    URL.revokeObjectURL(url);
+                                });
+                        }}
+                        style={{
+                            padding: "8px 16px",
+                            background: "white",
+                            color: "#1a73e8",
+                            border: "1px solid #1a73e8",
+                            borderRadius: 6,
+                            cursor: "pointer",
+                            fontSize: 13,
+                            fontWeight: 500,
+                        }}
+                    >
+                        📥 导出报告 (.md)
+                    </button>
+                </div>
             </div>
 
             {/* 两栏 */}
@@ -378,6 +410,9 @@ function AlignResult({
                     <RightPane row={report.rows[selectedIndex]} />
                 </div>
             </div>
+
+            {/* 论文总结 */}
+            <PaperSummary rows={report.rows} />
         </div>
     );
 }
@@ -603,6 +638,69 @@ function ReasoningPanel({ reasoning }: { reasoning?: string }) {
             {open && (
                 <div style={{ marginTop: 4, padding: 8, background: "white", border: "1px solid #e0e0e0", borderRadius: 4, fontSize: 12, color: "#5f6368", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
                     {reasoning}
+                </div>
+            )}
+        </div>
+    );
+}
+
+/** 论文总结组件：按重要度分条展示论文核心声明 */
+function PaperSummary({ rows }: { rows: AlignmentReport["rows"] }) {
+    const [collapsed, setCollapsed] = useState(true);
+    const coreClaims = rows.filter(r => (r.claim.importance ?? 2) === 1);
+    const supportClaims = rows.filter(r => (r.claim.importance ?? 2) === 2);
+    const detailClaims = rows.filter(r => (r.claim.importance ?? 2) === 3);
+
+    return (
+        <div style={{ marginTop: 16, background: "white", border: "1px solid #e0e0e0", borderRadius: 8 }}>
+            <div
+                onClick={() => setCollapsed(!collapsed)}
+                style={{
+                    padding: "12px 16px",
+                    cursor: "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    userSelect: "none",
+                    borderBottom: collapsed ? "none" : "1px solid #e0e0e0",
+                }}
+            >
+                <span style={{ fontSize: 14, color: "#666" }}>{collapsed ? "▶" : "▼"}</span>
+                <span style={{ fontSize: 15, fontWeight: 600, color: "#202124" }}>📝 论文总结</span>
+                <span style={{ fontSize: 12, color: "#999" }}>{rows.length} 个声明</span>
+            </div>
+            {!collapsed && (
+                <div style={{ padding: "8px 16px 16px" }}>
+                    {coreClaims.length > 0 && (
+                        <div style={{ marginBottom: 12 }}>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: "#c62828", marginBottom: 6 }}>🔴 核心贡献</div>
+                            {coreClaims.map((r, i) => (
+                                <div key={i} style={{ fontSize: 13, color: "#333", padding: "3px 0 3px 16px", lineHeight: 1.5 }}>
+                                  • {r.claim.description}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                    {supportClaims.length > 0 && (
+                        <div style={{ marginBottom: 12 }}>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: "#f9a825", marginBottom: 6 }}>🟡 支撑组件</div>
+                            {supportClaims.map((r, i) => (
+                                <div key={i} style={{ fontSize: 13, color: "#333", padding: "3px 0 3px 16px", lineHeight: 1.5 }}>
+                                  • {r.claim.description}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                    {detailClaims.length > 0 && (
+                        <div>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: "#1565c0", marginBottom: 6 }}>🔵 实现细节</div>
+                            {detailClaims.map((r, i) => (
+                                <div key={i} style={{ fontSize: 13, color: "#333", padding: "3px 0 3px 16px", lineHeight: 1.5 }}>
+                                  • {r.claim.description}
+                                </div>
+                            ))}
+                        </div>
+                    )}
                 </div>
             )}
         </div>
