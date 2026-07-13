@@ -6,7 +6,7 @@ import rehypeHighlight from "rehype-highlight";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
-import { CodeViewer } from "./components/CodeViewer";
+
 
 const API_BASE = import.meta.env.VITE_GATEWAY_URL ?? "http://localhost:4000";
 
@@ -90,15 +90,23 @@ const STATUS_META: Record<AlignStatus, { icon: string; label: string; color: str
     missing: { icon: "❔", label: "缺失", color: "#5f6368", bg: "#f1f3f4" },
 };
 
-const CLAIM_TYPE_META: Record<ClaimType, { icon: string; label: string; color: string }> = {
-    formula: { icon: "📐", label: "公式", color: "#7b1fa2" },
-    loss: { icon: "🧮", label: "损失", color: "#c62828" },
-    algorithm: { icon: "⚙️", label: "算法", color: "#1565c0" },
-    hyperparam: { icon: "🎛️", label: "超参", color: "#6a1b9a" },
-    training: { icon: "🏋️", label: "训练", color: "#2e7d32" },
-    data: { icon: "📊", label: "数据", color: "#ef6c00" },
-    arch: { icon: "🏛️", label: "结构", color: "#455a64" },
-};
+const mdStyle = `
+    .report-md h1 { font-size: 22px; border-bottom: 2px solid #1a73e8; padding-bottom: 8px; margin: 24px 0 16px; color: #202124; }
+    .report-md h2 { font-size: 18px; margin: 20px 0 12px; color: #202124; }
+    .report-md h3 { font-size: 15px; margin: 16px 0 8px; color: #202124; }
+    .report-md code { background: #f1f3f4; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+    .report-md pre { background: #f8f9fa; border: 1px solid #e0e0e0; border-radius: 6px; padding: 12px; overflow-x: auto; }
+    .report-md pre code { background: none; padding: 0; }
+    .report-md table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+    .report-md th, .report-md td { border: 1px solid #e0e0e0; padding: 8px 12px; text-align: left; font-size: 13px; }
+    .report-md th { background: #f8f9fa; font-weight: 600; }
+    .report-md blockquote { border-left: 3px solid #1a73e8; margin: 12px 0; padding: 8px 16px; background: #f8f9fa; color: #5f6368; }
+    .report-md ul, .report-md ol { padding-left: 24px; margin: 8px 0; }
+    .report-md li { margin: 4px 0; }
+    .report-md a { color: #1a73e8; }
+`;
+
+
 
 // ───────────── 主组件 ─────────────
 
@@ -114,7 +122,6 @@ export function UnifiedResearchApp() {
     const [alignLoading, setAlignLoading] = useState(false);
     const [alignProgress, setAlignProgress] = useState<ProgressEvent[]>([]);
     const [alignmentReport, setAlignmentReport] = useState<AlignmentReport | null>(null);
-    const [selectedClaimIndex, setSelectedClaimIndex] = useState(0);
     const [alignError, setAlignError] = useState<string | null>(null);
 
     // 模块3: 对话
@@ -214,7 +221,6 @@ export function UnifiedResearchApp() {
                             setAlignProgress((prev) => [...prev, { stage: payload.stage, info: payload.info }]);
                         } else if (payload.type === "done") {
                             setAlignmentReport(payload.report);
-                            setSelectedClaimIndex(0);
                         } else if (payload.type === "error") {
                             throw new Error(payload.error);
                         }
@@ -336,7 +342,6 @@ export function UnifiedResearchApp() {
                                     if (data.report) {
                                         setAlignmentReport(data.report);
                                         setArxivIdInput(data.report.paper.arxivId);
-                                        setSelectedClaimIndex(0);
                                     }
                                 })
                                 .catch(() => {});
@@ -925,78 +930,11 @@ export function UnifiedResearchApp() {
                             </div>
                         </div>
 
-                        <div style={{ display: "grid", gridTemplateColumns: "minmax(380px, 1fr) minmax(0, 1.4fr)", gap: 12, minHeight: 600 }}>
-                            <div style={{ background: "white", border: "1px solid #e0e0e0", borderRadius: 8, overflow: "auto", maxHeight: "75vh" }}>
-                                {[...alignmentReport.rows].sort((a, b) => {
-                                    const ai = a.claim.importance ?? 2;
-                                    const bi = b.claim.importance ?? 2;
-                                    if (ai !== bi) return bi - ai;
-                                    const order: Record<AlignStatus, number> = { match: 0, partial: 1, mismatch: 2, missing: 3 };
-                                    return order[a.status] - order[b.status];
-                                }).map((row) => {
-                                    const originalIndex = alignmentReport.rows.indexOf(row);
-                                    return (
-                                        <div
-                                            key={originalIndex}
-                                            onClick={() => setSelectedClaimIndex(originalIndex)}
-                                            style={{
-                                                padding: "12px 14px",
-                                                borderBottom: "1px solid #f1f3f4",
-                                                cursor: "pointer",
-                                                background: originalIndex === selectedClaimIndex ? "#e8f0fe" : "transparent",
-                                                borderLeft: originalIndex === selectedClaimIndex ? "3px solid #1a73e8" : "3px solid transparent",
-                                            }}
-                                        >
-                                            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6, flexWrap: "wrap" }}>
-                                                <span style={{ background: STATUS_META[row.status].bg, color: STATUS_META[row.status].color, padding: "2px 8px", borderRadius: 10, fontSize: 11, fontWeight: 600 }}>
-                                                    {STATUS_META[row.status].icon} {STATUS_META[row.status].label}
-                                                </span>
-                                                {row.claim.type && (
-                                                    <span style={{ color: CLAIM_TYPE_META[row.claim.type].color, fontSize: 11, fontWeight: 600, background: `${CLAIM_TYPE_META[row.claim.type].color}14`, padding: "2px 8px", borderRadius: 10 }}>
-                                                        {CLAIM_TYPE_META[row.claim.type].icon} {CLAIM_TYPE_META[row.claim.type].label}
-                                                    </span>
-                                                )}
-                                                <span style={{ fontSize: 11, color: "#999", marginLeft: "auto" }}>#{originalIndex + 1} · {row.claim.location}</span>
-                                            </div>
-                                            <div style={{ fontSize: 14, color: "#202124", marginBottom: 4 }}>{row.claim.description}</div>
-                                            {row.matchedFunction && (
-                                                <div style={{ fontSize: 12, color: "#5f6368" }}>📍 {row.matchedFunction.file} · {row.matchedFunction.name}</div>
-                                            )}
-                                        </div>
-                                    );
-                                })}
-                            </div>
-
-                            <div style={{ position: "sticky", top: 0, alignSelf: "start" }}>
-                                {alignmentReport.rows[selectedClaimIndex]?.matchedFunction ? (
-                                    <div style={{ background: "white", border: "1px solid #e0e0e0", borderRadius: 8, padding: 10 }}>
-                                        <CodeViewer
-                                            code={alignmentReport.rows[selectedClaimIndex].matchedFunction.body}
-                                            filePath={alignmentReport.rows[selectedClaimIndex].matchedFunction.file}
-                                            language="python"
-                                            highlightRange={{
-                                                start: alignmentReport.rows[selectedClaimIndex].matchedFunction.startLine,
-                                                end: alignmentReport.rows[selectedClaimIndex].matchedFunction.endLine,
-                                            }}
-                                            focusLine={alignmentReport.rows[selectedClaimIndex].evidenceLine ?? alignmentReport.rows[selectedClaimIndex].matchedFunction.startLine}
-                                            lineNumberStart={alignmentReport.rows[selectedClaimIndex].matchedFunction.startLine}
-                                            contextWindow={4}
-                                            maxHeight={520}
-                                        />
-                                        <div style={{ marginTop: 8, padding: 12, background: "#f8f9fa", borderRadius: 6 }}>
-                                            <div style={{ fontSize: 13, color: "#202124" }}>{alignmentReport.rows[selectedClaimIndex].note}</div>
-                                        </div>
-                                    </div>
-                                ) : (
-                                    <div style={{ background: "white", border: "1px solid #e0e0e0", borderRadius: 8, padding: 24, textAlign: "center", color: "#5f6368", minHeight: 400 }}>
-                                        选择左侧的声明以查看对应代码
-                                    </div>
-                                )}
-                            </div>
+                        {/* Markdown 报告预览 */}
+                        <div className="report-md" style={{ background: "white", border: "1px solid #e0e0e0", borderRadius: 8, padding: "16px 24px", maxHeight: "80vh", overflow: "auto", lineHeight: 1.7, fontSize: 14 }}>
+                            <style>{mdStyle}</style>
+                            <ReactMarkdown remarkPlugins={[remarkGfm]}>{alignmentReport.markdown}</ReactMarkdown>
                         </div>
-
-                        {/* 论文总结 */}
-                        <PaperSummary rows={alignmentReport.rows} />
                     </div>
                 )}
             </section>
@@ -1270,69 +1208,6 @@ function ExecTimeline({ steps }: { steps: ExecStep[] }) {
                             </div>
                         );
                     })}
-                </div>
-            )}
-        </div>
-    );
-}
-
-/** 论文总结组件：按重要度分条展示论文核心声明 */
-function PaperSummary({ rows }: { rows: AlignmentReport["rows"] }) {
-    const [collapsed, setCollapsed] = useState(true);
-    const coreClaims = rows.filter(r => (r.claim.importance ?? 2) === 1);
-    const supportClaims = rows.filter(r => (r.claim.importance ?? 2) === 2);
-    const detailClaims = rows.filter(r => (r.claim.importance ?? 2) === 3);
-
-    return (
-        <div style={{ marginTop: 16, background: "white", border: "1px solid #e0e0e0", borderRadius: 8 }}>
-            <div
-                onClick={() => setCollapsed(!collapsed)}
-                style={{
-                    padding: "12px 16px",
-                    cursor: "pointer",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 8,
-                    userSelect: "none",
-                    borderBottom: collapsed ? "none" : "1px solid #e0e0e0",
-                }}
-            >
-                <span style={{ fontSize: 14, color: "#666" }}>{collapsed ? "▶" : "▼"}</span>
-                <span style={{ fontSize: 15, fontWeight: 600, color: "#202124" }}>📝 论文总结</span>
-                <span style={{ fontSize: 12, color: "#999" }}>{rows.length} 个声明</span>
-            </div>
-            {!collapsed && (
-                <div style={{ padding: "8px 16px 16px" }}>
-                    {coreClaims.length > 0 && (
-                        <div style={{ marginBottom: 12 }}>
-                            <div style={{ fontSize: 13, fontWeight: 600, color: "#c62828", marginBottom: 6 }}>🔴 核心贡献</div>
-                            {coreClaims.map((r, i) => (
-                                <div key={i} style={{ fontSize: 13, color: "#333", padding: "3px 0 3px 16px", lineHeight: 1.5 }}>
-                                  • {r.claim.description}
-                                </div>
-                            ))}
-                        </div>
-                    )}
-                    {supportClaims.length > 0 && (
-                        <div style={{ marginBottom: 12 }}>
-                            <div style={{ fontSize: 13, fontWeight: 600, color: "#f9a825", marginBottom: 6 }}>🟡 支撑组件</div>
-                            {supportClaims.map((r, i) => (
-                                <div key={i} style={{ fontSize: 13, color: "#333", padding: "3px 0 3px 16px", lineHeight: 1.5 }}>
-                                  • {r.claim.description}
-                                </div>
-                            ))}
-                        </div>
-                    )}
-                    {detailClaims.length > 0 && (
-                        <div>
-                            <div style={{ fontSize: 13, fontWeight: 600, color: "#1565c0", marginBottom: 6 }}>🔵 实现细节</div>
-                            {detailClaims.map((r, i) => (
-                                <div key={i} style={{ fontSize: 13, color: "#333", padding: "3px 0 3px 16px", lineHeight: 1.5 }}>
-                                  • {r.claim.description}
-                                </div>
-                            ))}
-                        </div>
-                    )}
                 </div>
             )}
         </div>

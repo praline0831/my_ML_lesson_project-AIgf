@@ -6,280 +6,72 @@ export interface AlignerOptions {
     llm?: LLMClient;
 }
 
-/* ─── Claim 角色检测 ─── */
-
-type ClaimRole = 'architecture' | 'training' | 'inference';
-
-function detectClaimRole(claim: PaperClaim): ClaimRole {
-    const text = `${claim.description} ${claim.quote || ''}`.toLowerCase();
-    let train = 0, infer = 0;
-    if (/loss|training|optimization|weight.*updat|gradient|optimizer|l1|l2|mse|backward/.test(text)) train++;
-    if (/sample|reverse|denoise|inference|predict|generate|scheduler|step.*timestep/.test(text)) infer++;
-    if (train > infer && train > 0) return 'training';
-    if (infer > train && infer > 0) return 'inference';
-    return 'architecture';
+function getBodyPreview(fn: CodeFunction, maxChars: number = 2500): string {
+    if (fn.body.length <= maxChars) return fn.body;
+    // keep head (signature + setup) and tail (computation + return), skip middle boilerplate
+    const head = Math.floor(maxChars * 0.6);
+    const tail = maxChars - head;
+    return fn.body.slice(0, head) + '\n    # ... (truncated) ...\n' + fn.body.slice(-tail);
 }
 
-/* ─── 元数据提取 ─── */
-
-function extractDocstring(body: string): string {
-    const lines = body.split('\n');
-    for (let i = 0; i < Math.min(5, lines.length); i++) {
-        const t = lines[i].trim();
-        if ((t.startsWith('"""') || t.startsWith("'''"))) {
-            const docLines: string[] = [];
-            let inDoc = true;
-            const rest = t.slice(3).trim();
-            if (rest.endsWith('"""') || rest.endsWith("'''")) { docLines.push(rest.slice(0, -3).trim()); inDoc = false; }
-            else if (rest) docLines.push(rest);
-            for (let j = i + 1; j < lines.length && inDoc; j++) {
-                const l = lines[j].trim();
-                if (l.endsWith('"""') || l.endsWith("'''")) { docLines.push(l.slice(0, -3).trim()); break; }
-                docLines.push(l);
-            }
-            if (docLines.length) return docLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-        }
-    }
-    const comments: string[] = [];
-    for (const line of lines) {
-        const t = line.trim();
-        if (t.startsWith('#')) comments.push(t.replace(/^#\s*/, ''));
-        else if (comments.length > 0 && t === '') continue;
-        else if (comments.length > 0) break;
-    }
-    return comments.join('\n');
+function makeFnDescription(fn: CodeFunction): string {
+    const preview = getBodyPreview(fn, 2500);
+    return `[FILE] ${fn.file}
+[FUNC] ${fn.name} (L${fn.startLine}-${fn.endLine})
+[SIG] ${fn.signature}
+[BODY]
+${preview}
+[END]`;
 }
 
-function extractTrainableParams(body: string): string[] {
-    const out: string[] = [];
-    const seen = new Set<string>();
-    let m: RegExpExecArray | null;
-    while ((m = /self\.(\w+)\s*=\s*nn\.Parameter\(/g.exec(body)) !== null) { if (!seen.has(m[1])) { seen.add(m[1]); out.push(`${m[1]}(Parameter)`); } }
-    while ((m = /self\.(\w+)\s*=\s*nn\.(\w+)\(/g.exec(body)) !== null) { if (!seen.has(m[1])) { seen.add(m[1]); out.push(`${m[1]}(${m[2]})`); } }
-    return out;
+function extractClaimKeywords(claim: PaperClaim): string[] {
+    const text = `${claim.description} ${claim.quote || ''} ${claim.location}`.toLowerCase();
+    const words = text.split(/[\s,;:()\[\]{}=+\-*/\\'"`<>!?|.…、，。；：（）【】"「」『』《》]+/);
+    const stopwords = new Set(['the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+        'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+        'should', 'may', 'might', 'shall', 'can', 'need', 'this', 'that', 'these',
+        'those', 'with', 'from', 'for', 'over', 'under', 'between', 'through',
+        'during', 'before', 'after', 'above', 'below', 'up', 'down', 'in', 'out',
+        'on', 'off', 'of', 'to', 'by', 'at', 'and', 'or', 'not', 'no', 'but',
+        'each', 'every', 'all', 'both', 'few', 'more', 'most', 'other', 'some',
+        'such', 'than', 'then', 'also', 'very', 'just', 'about', 'into', 'upon',
+        'via', 'per', 'its', 'their', 'our', 'your', 'his', 'her', 'use', 'used',
+        'using', 'based', 'shown', 'method', 'approach', 'propose', 'proposed',
+        'new', 'novel', 'paper', 'section', 'figure', 'table', 'equation', 'eq']);
+    return words.filter(w => w.length >= 3 && !/^\d+$/.test(w) && !stopwords.has(w));
 }
 
-function extractTorchOps(body: string): string[] {
-    const ops = new Set<string>();
-    let m: RegExpExecArray | null;
-    while ((m = /(?:torch|F)\.(\w+)/g.exec(body)) !== null) ops.add(m[1]);
-    while ((m = /nn\.(\w+)/g.exec(body)) !== null) ops.add(`nn.${m[1]}`);
-    return [...ops];
-}
-
-function extractTokens(text: string): string[] {
-    return text.toLowerCase().split(/[\s,;:()\[\]{}=+\-*/\\'"`<>!?|.…、，。；：（）【】"「」『』《》]+/).filter(w => w.length >= 3 && !/^\d+$/.test(w));
-}
-
-function extractMathOps(text: string): string[] {
-    const ops: string[] = [];
-    const patterns = ['sqrt', 'matmul', 'softmax', 'sigmoid', 'tanh', 'relu', 'gelu', 'mean', 'sum', 'abs', 'log', 'exp', 'sin', 'cos', 'norm', 'cat', 'stack', 'split', 'chunk', 'gather', 'scatter', 'einsum', 'meshgrid', 'where', 'clamp', 'reshape', 'view', 'transpose', 'permute', 'flatten', 'unsqueeze', 'squeeze', 'pad', 'conv', 'pool', 'dropout', 'batch_norm', 'layer_norm', 'linear', 'embedding', 'cross_entropy', 'mse_loss', 'l1_loss', 'bce_loss', 'nll_loss', 'kl_div'];
-    for (const p of patterns) { if (text.includes(p)) ops.push(p); }
-    return ops;
-}
-
-/* ─── 调用链解析：找 self.xxx 引用的外部模块 ─── */
-
-function resolveCallees(body: string, allFunctions: CodeFunction[]): CodeFunction[] {
-    const refs = new Set<string>();
-    let m: RegExpExecArray | null;
-    while ((m = /self\.(\w+)/g.exec(body)) !== null) refs.add(m[1]);
-
-    const found: CodeFunction[] = [];
-    for (const ref of refs) {
-        for (const fn of allFunctions) {
-            if (fn.name === ref || fn.name.endsWith('.' + ref)) {
-                found.push(fn);
-                break;
-            }
-        }
-    }
-    return found;
-}
-
-/* ─── 检索 & 展开 ─── */
-
-function retrieveRelevant(claim: PaperClaim, functions: CodeFunction[], role: ClaimRole, topK: number = 10): CodeFunction[] {
-    const tokens = extractTokens(`${claim.description} ${claim.quote || ''} ${claim.location}`);
-    if (tokens.length === 0) return functions.slice(0, topK);
+function retrieveRelevant(claim: PaperClaim, functions: CodeFunction[], topK: number = 5): CodeFunction[] {
+    const keywords = extractClaimKeywords(claim);
+    if (keywords.length === 0) return functions.slice(0, topK);
 
     const scored = functions.map(fn => {
-        const sig = `${fn.file}::${fn.name} ${fn.signature}`.toLowerCase();
+        let score = 0;
+        const name = `${fn.file}::${fn.name}`.toLowerCase();
+        const sig = fn.signature.toLowerCase();
         const body = fn.body.toLowerCase();
-        let score = tokens.filter(t => sig.includes(t)).length;
-        score += tokens.filter(t => body.includes(t)).length * 0.2;
-        score += extractTorchOps(fn.body).length * 0.1;
 
-        // 角色路由
-        if (role === 'training' && /_step|_loss|configure_optim/i.test(fn.name)) score += 15;
-        if (role === 'inference' && /sample|predict|generate|_step|no_grad/i.test(fn.name)) score += 15;
-        if (role === 'architecture' && /forward|__init__|build/i.test(fn.name)) score += 5;
+        for (const kw of keywords) {
+            if (name.includes(kw)) score += 10;
+            else if (sig.includes(kw)) score += 6;
+            else if (body.includes(kw)) score += 3;
+        }
+
+        if (fn.name === 'forward') score += 2;
+        if (fn.name === '__init__') score += 1;
 
         return { fn, score };
     });
 
     scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, topK).map(s => s.fn);
+    const top = scored.slice(0, topK);
+    return top.map(s => s.fn);
 }
 
-function expandWithClass(candidates: CodeFunction[], allFunctions: CodeFunction[]): CodeFunction[] {
-    const map = new Map<string, CodeFunction>();
-    const add = (fn: CodeFunction) => map.set(`${fn.file}::${fn.name}`, fn);
-
-    for (const fn of candidates) {
-        add(fn);
-        const dot = fn.name.lastIndexOf('.');
-        if (dot > 0) {
-            const parentName = fn.name.slice(0, dot);
-            const parent = allFunctions.find(f => f.name === parentName && f.file === fn.file);
-            if (parent) add(parent);
-        } else {
-            for (const f of allFunctions) {
-                if (f.file === fn.file && f.name.startsWith(fn.name + '.')) add(f);
-            }
-        }
-        // 包装器展开：只有 0 算子函数才解析 self.xxx 调用
-        if (extractTorchOps(fn.body).length === 0) {
-            for (const callee of resolveCallees(fn.body, allFunctions)) add(callee);
-        }
-    }
-    return [...map.values()];
+function shortSummary(fn: CodeFunction): string {
+    const preview = getBodyPreview(fn, 400);
+    return `[${fn.file}::${fn.name}](L${fn.startLine}-${fn.endLine}) ${fn.signature.replace(/\s+/g, ' ').slice(0, 120)}\n| ${preview.slice(0, 300).replace(/\n/g, '\\n')}`;
 }
-
-/* ─── 分组 & 算子密集渲染 ─── */
-
-function groupByClass(fns: CodeFunction[]): { cls: CodeFunction; methods: CodeFunction[] }[] {
-    const groups: { cls: CodeFunction; methods: CodeFunction[] }[] = [];
-    const standalone: CodeFunction[] = [];
-
-    for (const fn of fns) {
-        if (fn.name.lastIndexOf('.') > 0) { standalone.push(fn); }
-        else { groups.push({ cls: fn, methods: [] }); }
-    }
-
-    const orphans: CodeFunction[] = [];
-    for (const sa of standalone) {
-        const dot = sa.name.lastIndexOf('.');
-        const parentName = sa.name.slice(0, dot);
-        const parent = groups.find(c => c.cls.name === parentName && c.cls.file === sa.file);
-        (parent ? parent.methods : orphans).push(sa);
-    }
-    for (const o of orphans) groups.push({ cls: o, methods: [] });
-    return groups;
-}
-
-/** 算子密集行渲染：只展示包含 torch/F/nn 调用的行（含行号） */
-function renderFnDense(fn: CodeFunction, indent: string, isClass: boolean): string {
-    const doc = extractDocstring(fn.body);
-    const lines = fn.body.split('\n');
-    const torchLines: { n: number; text: string }[] = [];
-
-    if (!isClass) {
-        for (let i = 0; i < lines.length; i++) {
-            if (/(?:torch|F|nn)\./.test(lines[i]) || /return\s/.test(lines[i]) || /loss|optim|backward|step\(\)/.test(lines[i])) {
-                torchLines.push({ n: i + 1, text: lines[i] });
-            }
-        }
-    }
-
-    let s = `${indent}${fn.name}`;
-    if (doc) s += ` — "${doc.slice(0, 100).replace(/\n/g, ' ')}"`;
-
-    const params = extractTrainableParams(fn.body);
-    if (isClass && params.length) s += ` | params: ${params.join(', ')}`;
-
-    const ops = extractTorchOps(fn.body);
-    if (ops.length) s += ` | torch: ${ops.slice(0, 10).join(', ')}`;
-
-    s += `\n${indent}  sig: ${fn.signature.slice(0, 140).replace(/\n/g, ' ')}`;
-
-    if (isClass) {
-        if (doc) s += `\n${indent}  doc: ${doc.slice(0, 250).replace(/\n/g, `\n${indent}  `)}`;
-    } else if (torchLines.length > 0) {
-        const show = torchLines.slice(0, 8);
-        for (const l of show) {
-            s += `\n${indent}  L${l.n}: ${l.text.trim()}`;
-        }
-        if (torchLines.length > 20) s += `\n${indent}  ... (${torchLines.length - 20} more op lines)`;
-    } else {
-        // 0 算子 → 包装器，显示 note
-        const head = lines.slice(0, Math.min(5, lines.length)).join(`\n${indent}  `);
-        s += `\n${indent}  (no torch ops — wrapper/container)`;
-        s += `\n${indent}  ${head}`;
-    }
-    return s;
-}
-
-function renderGrouped(groups: { cls: CodeFunction; methods: CodeFunction[] }[]): { text: string; lookup: CodeFunction[] } {
-    const parts: string[] = [];
-    const lookup: CodeFunction[] = [];
-
-    for (const g of groups) {
-        const isOrphan = g.methods.length === 0;
-        lookup.push(g.cls);
-        parts.push(renderFnDense(g.cls, '', !isOrphan));
-        for (const m of g.methods) {
-            lookup.push(m);
-            parts.push(renderFnDense(m, '  ', false));
-        }
-        parts.push('');
-    }
-    return { text: parts.join('\n'), lookup };
-}
-
-/* ─── 算子锚点证据提取 ─── */
-
-function buildEvidenceSpan(fn: CodeFunction, claim: PaperClaim): EvidenceSpan | null {
-    const bodyLines = fn.body.split('\n');
-    const mathOps = extractMathOps(`${claim.description} ${claim.quote || ''}`);
-
-    if (mathOps.length === 0) {
-        // 没有数学算子 → 返回 torch 密集行
-        const opLines = bodyLines.map((l, i) => ({ n: i, has: /(?:torch|F|nn)\./.test(l) })).filter(x => x.has);
-        if (opLines.length > 0) {
-            const first = Math.max(0, opLines[0].n - 2);
-            const last = Math.min(bodyLines.length - 1, opLines[opLines.length - 1].n + 2);
-            return {
-                startLine: fn.startLine + first,
-                endLine: fn.startLine + last,
-                codeSnippet: bodyLines.slice(first, last + 1).join('\n'),
-            };
-        }
-        return { startLine: fn.startLine, endLine: fn.endLine, codeSnippet: bodyLines.slice(0, 10).join('\n') };
-    }
-
-    // 找包含 mathOps 的行
-    const matchLines: number[] = [];
-    for (let i = 0; i < bodyLines.length; i++) {
-        const lc = bodyLines[i].toLowerCase();
-        if (mathOps.some(op => lc.includes(op))) matchLines.push(i);
-    }
-
-    if (matchLines.length === 0) {
-        // 回退：返回 torch 密集行
-        const opLines = bodyLines.map((l, i) => ({ n: i, has: /(?:torch|F|nn)\./.test(l) })).filter(x => x.has);
-        if (opLines.length > 0) {
-            const first = Math.max(0, opLines[0].n - 2);
-            const last = Math.min(bodyLines.length - 1, opLines[opLines.length - 1].n + 2);
-            return {
-                startLine: fn.startLine + first,
-                endLine: fn.startLine + last,
-                codeSnippet: bodyLines.slice(first, last + 1).join('\n'),
-            };
-        }
-        return { startLine: fn.startLine, endLine: fn.endLine, codeSnippet: bodyLines.slice(0, 10).join('\n') };
-    }
-
-    const first = Math.max(0, matchLines[0] - 3);
-    const last = Math.min(bodyLines.length - 1, matchLines[matchLines.length - 1] + 3);
-    return {
-        startLine: fn.startLine + first,
-        endLine: fn.startLine + last,
-        codeSnippet: bodyLines.slice(first, last + 1).join('\n'),
-    };
-}
-
-/* ─── 主逻辑 ─── */
 
 export class Aligner {
     private llm: LLMClient;
@@ -293,93 +85,271 @@ export class Aligner {
         functions: CodeFunction[],
         paperTitle?: string
     ): Promise<AlignmentRow[]> {
+        // Pass 1: retrieval-based per-claim matching with full body context
         const rows: AlignmentRow[] = [];
+        const missingClaims: { comp: PaperComponent; claim: PaperClaim }[] = [];
 
         for (const comp of components) {
             for (const claim of comp.claims) {
-                const role = detectClaimRole(claim);
-                const candidates = retrieveRelevant(claim, functions, role, 5);
-                if (candidates.length === 0) {
-                    rows.push({ claim, componentName: comp.name, status: 'mismatch', note: 'no candidates', confidence: 0 });
+                const relevant = retrieveRelevant(claim, functions, 5);
+
+                if (relevant.length === 0) {
+                    missingClaims.push({ comp, claim });
                     continue;
                 }
 
-                const expanded = expandWithClass(candidates, functions);
-                const groups = groupByClass(expanded);
-                const { text: rendered, lookup } = renderGrouped(groups);
+                const fnTexts = relevant.map(fn => makeFnDescription(fn)).join('\n\n');
 
-                const systemPrompt = `You are a COMPILER matching paper formulas to PyTorch operators, not a search engine.
-
-## Rules
-- Do NOT match by class/function name. "attention" in the name means NOTHING.
-- Do NOT match by docstring. Only match by actual torch operations.
-- You MUST find the EXACT torch.* / F.* / nn.* calls.
-- Prefer "mismatch" over fake match.
-
-Each entry shows:
-  ClassName | params: trainable components | torch: ops found
-  MethodName | torch: ops found
-    L42:  actual torch call in code
-
-"(no torch ops)" means the function delegates to other objects (self.xxx). Skip it.
+                const systemPrompt = `You are matching a paper claim to the most relevant code function. Match by operations in the FUNCTION BODY, not just function names.
 
 ## How to match
-  "Q = XW_q" → torch.matmul or nn.Linear
-  "softmax(QK^T/√d)" → F.softmax(torch.matmul(q,k.t())/sqrt(d))
-  "z_t = √ᾱ_t z + √(1-ᾱ_t)ε" → torch.sqrt(alpha_cumprod)*z + torch.sqrt(1-alpha_cumprod)*noise
-  "L = ||ε - ε_θ||²" → F.mse_loss(pred, noise)
+- "attention" → look for matmul + softmax + scaling
+- "QKV" → look for 3 linear projections (query, key, value)
+- "LoRA" → look for low-rank decomposition (A @ B)
+- "pooling" → look for reduce operations (mean, max, avg)
+- "upsampling" → look for interpolate, resize, nearest
+- "normalization" → look for norm, layer_norm, batch_norm
+- "loss" → look for loss function computation
 
-## Output
-{"functionIndex":3,"status":"match","note":"brief reason","confidence":0.9,"evidence":"torch op(s) found"}
+## Output JSON
+{"functionIndex": 2, "status": "match", "note": "short explanation", "confidence": 0.9, "evidence": "key code snippet", "evidenceLine": 15}
 
-- functionIndex: 0-based index in the code list (null = no match)
-- status: "match" | "partial" | "mismatch"
-- evidence: the actual torch op(s) (<=200 chars)`;
+- functionIndex: index of best matching function (0-based, or null if none)
+- status: "match" | "partial" | "missing"
+- evidence: key variable/operation that supports the match (<=120 chars)
+- evidenceLine: 1-based line within the function (1 = first line)`;
 
                 const userPrompt = `Paper: ${paperTitle || '(unknown)'}
-Component: ${comp.name}
-Claim: ${claim.description}${claim.quote ? ` — "${claim.quote}"` : ''}
-Role: ${role}
+Claim: ${claim.description}
+${claim.quote ? `Quote: "${claim.quote}"` : ''}
+Location: ${claim.location}
 
-Code (${lookup.length} entries):
-${rendered}
+Candidate functions (${relevant.length}):
+${fnTexts}
 
-Output JSON.`;
+Output JSON with best matching function.`;
+
+                interface SingleResult {
+                    functionIndex: number | null;
+                    status: 'match' | 'partial' | 'mismatch' | 'missing';
+                    note: string;
+                    confidence: number;
+                    evidence?: string;
+                    evidenceLine?: number;
+                }
 
                 try {
-                    const result = await this.llm.chatJson<{ functionIndex: number | null; status: string; note: string; confidence: number; evidence?: string }>(
-                        [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
-                        0.7,
-                    );
+                    const result = await this.llm.chatJson<SingleResult>([
+                        { role: 'system', content: systemPrompt },
+                        { role: 'user', content: userPrompt },
+                    ]);
 
-                    const idx = result.functionIndex != null && result.functionIndex >= 0 && result.functionIndex < lookup.length
+                    const idx = result.functionIndex != null && result.functionIndex >= 0 && result.functionIndex < relevant.length
                         ? result.functionIndex : null;
-                    const matchedFn = idx != null ? lookup[idx] : undefined;
+                    const matchedFn = idx != null ? relevant[idx] : undefined;
+                    const evidenceLine = matchedFn && result.evidenceLine != null
+                        ? matchedFn.startLine + result.evidenceLine - 1
+                        : undefined;
 
                     const row: AlignmentRow = {
                         claim, componentName: comp.name,
                         matchedFunction: matchedFn,
                         matchedFunctions: matchedFn ? [matchedFn] : undefined,
-                        status: result.status === 'match' || result.status === 'partial' || result.status === 'mismatch'
-                            ? result.status : 'mismatch',
+                        status: result.status || 'missing',
                         note: result.note || '',
                         confidence: typeof result.confidence === 'number' ? Math.max(0, Math.min(1, result.confidence)) : 0,
                         evidence: result.evidence,
+                        evidenceLine,
                     };
 
                     if (matchedFn && (result.status === 'match' || result.status === 'partial')) {
-                        const span = buildEvidenceSpan(matchedFn, claim);
-                        if (span) row.evidenceSpans = [span];
+                        const spans = await this.formulaAlign(claim, [matchedFn]);
+                        if (spans.length > 0) {
+                            row.evidenceSpans = spans;
+                            row.evidence = spans[0].codeSnippet.slice(0, 120);
+                            row.evidenceLine = spans[0].startLine;
+                        }
                     }
 
                     rows.push(row);
+                    if (result.status === 'missing' || result.status === 'mismatch') {
+                        missingClaims.push({ comp, claim });
+                    }
                 } catch (e) {
                     console.warn(`[aligner] claim failed: ${(e as Error).message}`);
-                    rows.push({ claim, componentName: comp.name, status: 'mismatch', note: 'LLM error', confidence: 0 });
+                    missingClaims.push({ comp, claim });
+                }
+            }
+        }
+
+        // Pass 2: flat batch fallback for claims that are still missing
+        if (missingClaims.length > 0 && functions.length > 0) {
+            console.log(`[aligner] fallback: trying flat alignment for ${missingClaims.length} missing claims`);
+            const fallbackRows = await this.flatFallback(missingClaims, functions, paperTitle);
+
+            for (const fbRow of fallbackRows) {
+                const existing = rows.find(r => r.claim === fbRow.claim);
+                if (existing && (existing.status === 'missing' || existing.status === 'mismatch')) {
+                    Object.assign(existing, fbRow);
                 }
             }
         }
 
         return rows;
+    }
+
+    private async flatFallback(
+        missingClaims: { comp: PaperComponent; claim: PaperClaim }[],
+        functions: CodeFunction[],
+        paperTitle?: string
+    ): Promise<AlignmentRow[]> {
+        const results: AlignmentRow[] = [];
+        const batchSize = 5;
+
+        for (let i = 0; i < missingClaims.length; i += batchSize) {
+            const batch = missingClaims.slice(i, i + batchSize);
+            const claimLines = batch.map(({ claim }, j) => {
+                const imp = claim.importance ? ` [imp=${claim.importance}]` : '';
+                return `[${j}]${imp} ${claim.description} (${claim.location})`;
+            }).join('\n');
+
+            const fnLines = functions.map((f, j) => `[${j}] ${shortSummary(f)}`).join('\n');
+
+            const systemPrompt = `You are an ML paper-code alignment expert. For each claim, find the best-matching function from the list.
+
+Each function entry: [ID] file::name(Lstart-Lend) | signature | body preview
+
+## Rules
+- Match by function name, file name, AND operations in the body preview
+- A function may implement the claim even if names differ — look at what it computes
+- If a function clearly implements the claim → set functionIndex, status "match"
+- If the core idea is present but details differ → status "partial"
+- If no function matches → set functionIndex null, status "missing"
+- Be concise in note (<=50 chars)
+
+## Output JSON
+{"alignments":[
+  {"claimIndex":0,"functionIndex":3,"status":"match","note":"QKV attention projection","confidence":0.9,"evidence":"q, k, v linear projections","evidenceLine":15},
+  {"claimIndex":1,"functionIndex":null,"status":"missing","note":"no match found","confidence":0.2}
+]}`;
+
+            const userPrompt = `Paper: ${paperTitle || '(unknown)'}
+
+Claims (${batch.length}):
+${claimLines}
+
+Function List (${functions.length} total):
+${fnLines}
+
+Output JSON with alignments.`;
+
+            interface FlatResult {
+                alignments: {
+                    claimIndex: number; functionIndex: number | null;
+                    status: 'match' | 'partial' | 'mismatch' | 'missing';
+                    note: string; confidence: number;
+                    evidence?: string; evidenceLine?: number;
+                }[];
+            }
+
+            try {
+                const result = await this.llm.chatJson<FlatResult>([
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: userPrompt },
+                ]);
+
+                for (const a of (result.alignments || [])) {
+                    const item = batch[a.claimIndex];
+                    if (!item) continue;
+                    const idx = a.functionIndex != null && a.functionIndex >= 0 && a.functionIndex < functions.length
+                        ? a.functionIndex : null;
+                    const matchedFn = idx != null ? functions[idx] : undefined;
+                    results.push({
+                        claim: item.claim,
+                        componentName: item.comp.name,
+                        matchedFunction: matchedFn,
+                        status: a.status || 'missing',
+                        note: a.note || '',
+                        confidence: typeof a.confidence === 'number' ? Math.max(0, Math.min(1, a.confidence)) : 0,
+                        evidence: a.evidence,
+                        evidenceLine: matchedFn && a.evidenceLine != null
+                            ? matchedFn.startLine + a.evidenceLine - 1 : undefined,
+                    });
+                }
+            } catch (e) {
+                console.warn(`[aligner] flat fallback batch failed: ${(e as Error).message}`);
+                for (const item of batch) {
+                    results.push({
+                        claim: item.claim, componentName: item.comp.name,
+                        status: 'missing', note: 'fallback failed', confidence: 0,
+                    });
+                }
+            }
+        }
+
+        return results;
+    }
+
+    async formulaAlign(claim: PaperClaim, matchedFunctions: CodeFunction[]): Promise<EvidenceSpan[]> {
+        if (matchedFunctions.length === 0) return [];
+
+        const funcsText = matchedFunctions.map((f, i) =>
+            `--- Function ${i + 1}: ${f.file} :: ${f.name} (L${f.startLine}-${f.endLine}) ---
+${f.body}
+---`).join('\n\n');
+
+        const systemPrompt = `Given a paper claim and its matching code function, find the EXACT lines where the formula is implemented.
+
+## Output format
+{"spans":[
+  {"startLine":45,"endLine":48,"codeSnippet":"result = F.linear(x, self.weight)\\n...","formulaContext":"W₀x + BAx","variableMappings":[
+    {"formulaVar":"W₀","codeVar":"self.weight","context":"base weight"}
+  ]}
+]}
+
+- startLine: 1-based line number in the function (1 = first line)
+- endLine: last line of the code block
+- codeSnippet: the actual code lines (2-15 lines)
+- formulaContext: which part of the formula this implements
+- variableMappings: map paper variables to code variables`;
+
+        const userPrompt = `Paper claim: ${claim.description}
+${claim.quote ? `Formula: ${claim.quote}` : ''}
+
+Code function:
+${funcsText}
+
+Find the exact lines implementing this formula. Output evidence spans.`;
+
+        interface FormulaResult {
+            spans: {
+                startLine: number;
+                endLine: number;
+                codeSnippet: string;
+                formulaContext?: string;
+                variableMappings?: { formulaVar: string; codeVar: string; context: string }[];
+            }[];
+        }
+
+        try {
+            const result = await this.llm.chatJson<FormulaResult>([
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userPrompt },
+            ]);
+
+            return (result.spans || []).map(s => ({
+                startLine: s.startLine,
+                endLine: s.endLine,
+                codeSnippet: s.codeSnippet,
+                formulaContext: s.formulaContext,
+                variableMappings: (s.variableMappings || []).map(m => ({
+                    formulaVar: m.formulaVar,
+                    codeVar: m.codeVar,
+                    context: m.context || '',
+                })),
+            }));
+        } catch {
+            return [];
+        }
     }
 }

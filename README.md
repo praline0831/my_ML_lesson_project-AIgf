@@ -42,7 +42,7 @@
 | **Skills 框架** | Claude 风格的 Skill 注册/激活/指令注入；内置 webSearch / calculator / paperAlign |
 | **论文检索** | arXiv API 集成；多轮 sub-query 生成 |
 | **深度研究** | 多轮迭代检索 → 去重 → 摘要 → 综合；生成结构化研究报告 |
-| **论文-代码对齐** | 两阶段论文解析（组件 → claims）→ 角色路由（architecture / training / inference 三种检索策略）→ 算子密集渲染（仅展示含 `torch.*` / `F.*` / `nn.*` 的行）→ 调用链自动展开（0 算子函数 → 回溯 `self.xxx` 调用）→ 算子锚点证据提取；对齐结果后自动生成**论文总结**（分核心贡献/支撑组件/实现细节三级展示）；支持**导出为 Markdown 报告** |
+| **论文-代码对齐** | 两阶段论文解析（组件 → claims）→ 关键词检索候选函数 → 逐 claim LLM 判读匹配 → 公式-代码行级证据提取 → 对齐结果输出 Markdown 报告，一键导出 |
 | **Markdown + LaTeX 渲染** | react-markdown + remark-gfm + remark-math + rehype-katex |
 | **流式接口** | SSE (Server-Sent Events) 实时返回 token、节点轨迹、确认请求、错误 |
 | **本地 LLM** | 通过 Ollama 运行本地模型（gemma4:31b-cloud / kimi-k2.5:cloud） |
@@ -56,7 +56,7 @@
 |                    Web 浏览器 (React 18 + Vite)                  |
 |  · 论文搜索 / 深度对话 / 论文-代码对齐 / 知识库面板              |
 |  · Human-in-the-loop 确认弹窗 · 执行轨迹 Timeline               |
-|  · Markdown + LaTeX / 代码高亮                                   |
+|  · Markdown + LaTeX 渲染 / 报告预览                              |
 +----------------------+------------------------------------------+
                        | HTTP + SSE
                        v
@@ -76,29 +76,29 @@
 |  apps/runtime          |   |  @agent/paper-align                |
 |  +-------------------+ |   |  · 两阶段解析 (组件->claims)       |
 |  | LangGraph StateGraph| |   |  · GitHub 仓库抓取 + 启发式排名   |
-|  |                   | |   |  · 角色路由 (3种检索策略)          |
-|  | retrieve (RAG)    | |   |  · 算子密集渲染 (仅 torch 行)      |
-|  |    v              | |   |  · 调用链展开 (0算子→回溯)       |
-|  | think (LLM)       | |   |  · LLM 复用 (LLMProviderAdapter)  |
+|  |                   | |   |  · 关键词检索候选函数              |
+|  | retrieve (RAG)    | |   |  · 逐 claim LLM 判读             |
+|  |    v              | |   |  · 公式-代码行级证据提取          |
+|  | think (LLM)       | |   |  · flat batch fallback (缺失回退) |
 |  |    v (conditional)| |   +------------------------------------+
 |  | +----------+      | |   +------------------------------------+
 |  | | act      |      | |   |  @agent/memory (持久化 RAG)        |
 |  | | (tool)   |      | |   |  · PersistentVectorStore           |
 |  | | +-HITL---+      | |   |  · JSON 持久化                     |
-|  | | | 确认   |      | |   |  · 结构化 metadata                 |
-|  | | +--------+      | |   +------------------------------------+
-|  | +----+-----+      | |
-|  |      v (loop)     | |   +------------------------------------+
-|  | summarize (每3轮) | |   |  @agent/paper                      |
-|  +-------------------+ |   |  · ArXiv 检索                      |
-+-----------------------+   |  · 多轮深度研究                     |
-                       |    +------------------------------------+
-                       v
-              +----------------------+
-              |  Ollama (localhost)   |
-              |  · gemma4:31b-cloud   |
-              |  · Embeddings 服务    |
-              +----------------------+
+|  | | | 确认   |      | |   +------------------------------------+
+|  | | +--------+      | |
+|  | +----+-----+      | |   +------------------------------------+
+|  |      v (loop)     | |   |  @agent/paper                      |
+|  | summarize (每3轮) | |   |  · ArXiv 检索                      |
+|  +-------------------+ |   |  · 多轮深度研究                     |
++-----------------------+   +------------------------------------+
+|                       |
+|                       v
+|               +----------------------+
+|               |  Ollama (localhost)  |
+|               |  · gemma4:31b-cloud  |
+|               |  · Embeddings 服务   |
+|               +----------------------+
 ```
 
 ---
@@ -336,12 +336,10 @@ GET  /memory/recent         # 最近 50 条
 - 上下文注入：对齐结果自动加载到对话
 
 ### 论文-代码对齐
-- 左侧：每条 Claim 卡片（描述 + 状态徽章 + 行号）
-- 右侧：代码查看器（语法高亮、行号重映射、焦点行高亮）
-- 顶部统计：匹配 / 部分 / 偏差 / 缺失
-- **论文总结**：对齐结果下方展示可折叠的论文总结面板，按重要度（核心贡献/支撑组件/实现细节）分条列出声明
-- **导出报告**：支持一键导出为 Markdown (.md) 文件
-- 聊天对齐结果自动同步到此面板
+- **Markdown 报告预览**：对齐结果直接渲染为带样式的 Markdown 报告（含表格、代码块、数学公式），支持滚动浏览
+- **统计徽章**：顶部显示匹配 / 部分 / 偏差 / 缺失的数量统计
+- **一键导出**：导出完整的 Markdown (.md) 报告文件
+- **聊天自动同步**：对齐结果自动加载到对话上下文
 
 ### 交互式对齐
 - **LLM 自主触发**：Agent 识别用户意图（如"帮我对齐LoRA""分析一下Transformer的代码实现"），自主调用 `interactive_align` 工具
@@ -437,7 +435,7 @@ START -> [retrieve] (RAG 查询)
 React 18 + Vite 单页应用。包含四个模块：
 - **论文搜索**：arXiv 检索
 - **深度对话**：Markdown 渲染 + Timeline + HITL 确认弹窗
-- **论文-代码对齐**：匹配矩阵 + CodeViewer
+- **论文-代码对齐**：Markdown 报告预览 + 一键导出
 - **知识库**：RAG Memory 面板
 
 ---
@@ -473,60 +471,47 @@ GitHub repo -> RepoFetcher (文件树 + 候选 .py 文件)
                 -> 取 top 30 函数供对齐
 ```
 
-不再使用 LLM 筛选函数（KeyFunctionSelector），改为纯启发式评分，避免昂贵的 LLM 调用和重要函数被误过滤。
-
 **对齐管线**：
 
 ```
 每条 claim 独立处理:
 
-  1. 角色路由 (Role Detection)
-     -> 检测 claim 关键词: loss/training → "training" 角色
-                           sample/reverse → "inference" 角色
-                           attention/conv → "architecture" 角色
-     -> 角色决定检索权重: training 角色对 *_step 名称权重 +15
+  Pass 1 — 关键词检索 + LLM 判读:
 
-  2. 算子检索 (Operator Retrieval)
-     -> claim 分词 → 检查函数名/路径/签名 + body 关键词 + torch 算子密度
-     -> top 5 候选函数
+  1. 关键词提取 (retrieveRelevant)
+     -> 从 claim description + quote 中提取关键词 (去停用词)
+     -> 对每个候选函数评分: 文件名/函数名匹配 +10, 签名 +6, body +3
+     -> 取 top 5 候选函数
 
-  3. 类-方法展开 + 调用链展开 (expandWithClass)
-     -> 候选是方法 → 加入父类
-     -> 候选是类 → 加入所有方法
-     -> 候选函数有 0 个 torch 算子 (包装器) → 解析 self.xxx 调用,加入被调者
+  2. LLM 判读 (逐 claim)
+     -> 系统 prompt 要求按函数体内的操作（非名称）匹配
+     -> 例如: "attention" → matmul + softmax + scaling
+     -> 输出: functionIndex, status(match/partial/missing), note, confidence, evidence, evidenceLine
+     -> 找不到匹配 → status:"missing"
 
-  4. 算子密集渲染 (Dense Operator Rendering)
-     -> 类: 显示 params(可训练参数) + torch 算子摘要,不显示 body
-     -> 方法: 仅显示包含 torch.* / F.* / nn.* 的行 (带行号 L42),最多 8 行
-     -> 0 算子函数标注 "(no torch ops — wrapper/container)"
+  3. 行级证据提取 (formulaAlign)
+     -> 对 match/partial 的 claim, 再次调用 LLM
+     -> 在匹配函数中定位具体实现行 (startLine/endLine)
+     -> 提取公式上下文 (formulaContext) 和变量映射 (variableMappings)
 
-  5. LLM 判定 (Per-Claim)
-     -> 温度 0.7, 禁止按名称/docstring 匹配,强制按 torch 算子匹配
-     -> 找不到对应算子 → status:"mismatch" (不强行造假)
-     -> 输出 functionIndex + status + evidence(实际算子)
+  Pass 2 — flat batch fallback (缺失回退):
 
-  6. 算子锚点证据提取 (buildEvidenceSpan)
-     -> 解析 claim 中数学算子 (sqrt, matmul, softmax, ...)
-     -> 在目标函数 body 中搜索含该算子的行
-     -> 截取 [命中行-3, 命中行+3] 作为证据片段
-     -> 无数学算子 → 回退到 torch 密集行
+  4. 上一步 missing 的 claim 按 5 条一批重试
+     -> 使用所有函数 (而非 top 5) 进行全量匹配
+     -> 统一的 flat prompt, 一次性输出所有匹配结果
 ```
 
-**匹配哲学**：LLM 被训练为编译器/调试器，而非搜索引擎。
-- 旧：根据函数名/类名/docstring 匹配（概念映射）→ 大量假阳性
-- 新：追踪 `torch.*` / `F.*` / `nn.*` 数据流向（算子映射）→ 找不到就是 mismatch
+**RepoFetcher**:
+- 通过 GitHub API 获取仓库文件树 (git/trees)
+- 启发式排序: 文件名关键词 + 目录深度 + 文件大小
+- 顺序抓取 raw 文件内容, 支持 HTTP 代理
+- 自动过滤 test/docs/examples 等非核心文件
 
-`mismatch` 不是系统的失败，而是**论文的创新点确实没在开源代码里实现**的信号。
+无角色路由, 无算子密度过滤, 无类/调用链展开, 无 JSON 修复。
 
-**LLM 容错**：
-
-```typescript
-// repairJson: 修复 LLM 输出的常见 JSON 错误
-// - 数组元素间的 stray quotes
-// - 字符串末尾的 stray closing parens
-// - 缺失的闭合括号/花括号
-// - 截断的尾部内容
-```
+**匹配哲学**：LLM 按函数体内的实际操作匹配，而非函数名/docstring。
+- match = 函数体内确实实现了 claim 描述的操作
+- missing = 找不到对应实现（不强行造假）
 
 **LLM 适配**：
 
@@ -597,11 +582,11 @@ Chat Agent 通过 `agent.registerTool('align_paper', ...)` 将 PaperAlignAgent �
 ### 6. 两阶段论文解析
 先提取核心组件（3-5 个），再对每个组件提取 claims（2-4 条），避免一次性提取遗漏细节。
 
-### 7. 算子映射 + 动态证据
-LLM 被训练为编译器：根据 claim 中的数学算子（sqrt/matmul/softmax）在函数体中搜索对应的 `torch.*` / `F.*` / `nn.*` 调用。找不到则标记 `mismatch`（说明论文创新点未在代码中实现）。证据片段以命中算子行为锚点，截取 ±3 行生成，杜绝 LLM 编造行号。
+### 7. 逐 claim LLM 判读 + 行级证据提取
+每条 claim 独立送入 LLM（含 top 5 候选函数的完整 body），LLM 按函数体内的具体操作匹配。匹配后再次调用 LLM 定位证据行和变量映射。两轮 LLM 调用，确保判读和证据分离。
 
-### 8. 绝对行号 <-> 相对行号换算
-`CodeViewer` 接收 `lineNumberStart` 映射函数体相对行号为文件绝对行号。
+### 8. Markdown 报告输出
+对齐结果（状态、证据行、变量映射）直接写入 Markdown，前端 ReactMarkdown 渲染，支持一键导出 `.md` 文件。
 
 ### 9. 交互式对齐流程
 通过独立的 SSE 端点 `/align/interactive/start` 实现多步引导流程，不依赖 LangGraph 图。架构分为：
@@ -639,7 +624,7 @@ ollama serve
 | `LLM_API_KEY` | `ollama` | API Key |
 | `LLM_MAX_TOKENS` | `8192` | 最大输出 token |
 | `GITHUB_TOKEN` | 无 | GitHub API Token（避免 429 限流）|
-| `HTTPS_PROXY` / `HTTP_PROXY` | 无 | 代理配置 |
+| `HTTPS_PROXY` / `HTTP_PROXY` | 无 | 代理配置（GitHub API 请求使用） |
 
 ---
 

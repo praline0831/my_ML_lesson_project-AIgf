@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { CodeViewer } from "./components/CodeViewer";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 const API_BASE = import.meta.env.VITE_GATEWAY_URL ?? "http://localhost:4000";
 
@@ -89,22 +90,6 @@ const STATUS_META: Record<AlignStatus, { icon: string; label: string; color: str
     missing: { icon: "❔", label: "缺失", color: "#5f6368", bg: "#f1f3f4" },
 };
 
-const CLAIM_TYPE_META: Record<ClaimType, { icon: string; label: string; color: string }> = {
-    formula: { icon: "📐", label: "公式", color: "#7b1fa2" },
-    loss: { icon: "🧮", label: "损失", color: "#c62828" },
-    algorithm: { icon: "⚙️", label: "算法", color: "#1565c0" },
-    hyperparam: { icon: "🎛️", label: "超参", color: "#6a1b9a" },
-    training: { icon: "🏋️", label: "训练", color: "#2e7d32" },
-    data: { icon: "📊", label: "数据", color: "#ef6c00" },
-    arch: { icon: "🏛️", label: "结构", color: "#455a64" },
-};
-
-const PRIORITY_META: Record<number, { icon: string; label: string; color: string }> = {
-    1: { icon: "🔴", label: "核心贡献", color: "#c62828" },
-    2: { icon: "🟡", label: "支撑组件", color: "#f9a825" },
-    3: { icon: "🔵", label: "实现细节", color: "#1565c0" },
-};
-
 // ───────────── 主组件 ─────────────
 
 export function AlignApp() {
@@ -114,8 +99,6 @@ export function AlignApp() {
     const [progress, setProgress] = useState<ProgressEvent[]>([]);
     const [report, setReport] = useState<AlignmentReport | null>(null);
     const [error, setError] = useState<string | null>(null);
-    const [selectedIndex, setSelectedIndex] = useState(0);
-    const [expandedComponents, setExpandedComponents] = useState<Record<string, boolean>>({});
 
     const run = async () => {
         if (!arxivId.trim() || loading) return;
@@ -162,14 +145,6 @@ export function AlignApp() {
                             ]);
                         } else if (payload.type === "done") {
                             setReport(payload.report);
-                            setSelectedIndex(0);
-                            if (payload.report?.components) {
-                                const expanded: Record<string, boolean> = {};
-                                payload.report.components.forEach((c: ComponentResult) => {
-                                    expanded[c.component.name] = true;
-                                });
-                                setExpandedComponents(expanded);
-                            }
                         } else if (payload.type === "error") {
                             throw new Error(payload.error);
                         }
@@ -243,474 +218,74 @@ export function AlignApp() {
             )}
 
             {/* 结果 */}
-            {report && (
-                <AlignResult
-                    report={report}
-                    selectedIndex={selectedIndex}
-                    onSelect={setSelectedIndex}
-                    expandedComponents={expandedComponents}
-                    onToggleComponent={(name) =>
-                        setExpandedComponents(prev => ({ ...prev, [name]: !prev[name] }))
-                    }
-                />
-            )}
+            {report && <AlignResult report={report} />}
         </div>
     );
 }
 
 // ───────────── 结果展示 ─────────────
 
-function AlignResult({
-    report,
-    selectedIndex,
-    onSelect,
-    expandedComponents,
-    onToggleComponent,
-}: {
-    report: AlignmentReport;
-    selectedIndex: number;
-    onSelect: (i: number) => void;
-    expandedComponents: Record<string, boolean>;
-    onToggleComponent: (name: string) => void;
-}) {
-    const components = report.components ?? [];
-    const hasComponents = components.length > 0;
+const mdStyle = `
+.report-md h1 { font-size: 1.4em; margin-top: 1em; border-bottom: 1px solid #e0e0e0; padding-bottom: 0.3em; }
+.report-md h2 { font-size: 1.2em; margin-top: 1em; }
+.report-md h3 { font-size: 1.1em; margin-top: 0.8em; }
+.report-md code { background: #f1f3f4; padding: 2px 5px; border-radius: 3px; font-size: 0.9em; }
+.report-md pre { background: #f8f9fa; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 0.85em; line-height: 1.5; }
+.report-md table { border-collapse: collapse; width: 100%; margin: 0.5em 0; }
+.report-md th, .report-md td { border: 1px solid #ddd; padding: 6px 10px; text-align: left; font-size: 0.9em; }
+.report-md th { background: #f5f5f5; font-weight: 600; }
+.report-md blockquote { border-left: 3px solid #1a73e8; margin: 0.5em 0; padding: 0.5em 1em; background: #f8f9fa; }
+.report-md img { max-width: 100%; }
+`;
 
+function AlignResult({ report }: { report: AlignmentReport }) {
     return (
         <div>
             {/* 头部信息 */}
             <div style={{ background: "white", border: "1px solid #e0e0e0", borderRadius: 8, padding: 14, marginBottom: 12 }}>
-                <h2 style={{ margin: "0 0 6px", fontSize: 18 }}>{report.paper.title}</h2>
-                <p style={{ margin: "4px 0", color: "#666", fontSize: 13 }}>
-                    📄 <a href={`https://arxiv.org/abs/${report.paper.arxivId}`} target="_blank" rel="noreferrer">
-                        {report.paper.arxivId}
-                    </a>
-                    {report.repo && (
-                        <>
-                            {" · "}🔗 <a href={report.repo.url} target="_blank" rel="noreferrer">
-                                {report.repo.owner}/{report.repo.repo}
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                    <div>
+                        <h2 style={{ margin: "0 0 6px", fontSize: 18 }}>{report.paper.title}</h2>
+                        <p style={{ margin: "4px 0", color: "#666", fontSize: 13 }}>
+                            📄 <a href={`https://arxiv.org/abs/${report.paper.arxivId}`} target="_blank" rel="noreferrer">
+                                {report.paper.arxivId}
                             </a>
-                        </>
-                    )}
-                </p>
-                <SummaryBadges summary={report.summary} />
-                {hasComponents && (
-                    <div style={{ marginTop: 10, fontSize: 12, color: "#5f6368", lineHeight: 1.6 }}>
-                        <strong>🏗 架构总览：</strong>
-                        {components.map(({ component }) => {
-                            const pm = PRIORITY_META[component.priority] ?? PRIORITY_META[3];
-                            return (
-                                <span key={component.name} style={{ marginRight: 12, whiteSpace: "nowrap" }}>
-                                    {pm.icon} <strong>{component.name}</strong>
-                                    <span style={{ color: "#999" }}> — {component.description.slice(0, 60)}</span>
-                                </span>
-                            );
-                        })}
+                            {report.repo && (
+                                <>{" · "}🔗 <a href={report.repo.url} target="_blank" rel="noreferrer">
+                                    {report.repo.owner}/{report.repo.repo}
+                                </a></>
+                            )}
+                        </p>
                     </div>
-                )}
-                <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
-                    <button
-                        onClick={() => {
-                            fetch(`${API_BASE}/align/export`, {
-                                method: "POST",
-                                headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({ markdown: report.markdown, arxiv_id: report.paper.arxivId }),
-                            })
-                                .then(res => res.blob())
-                                .then(blob => {
-                                    const url = URL.createObjectURL(blob);
-                                    const a = document.createElement("a");
-                                    a.href = url;
-                                    a.download = `align-${report.paper.arxivId}-${Date.now()}.md`;
-                                    a.click();
-                                    URL.revokeObjectURL(url);
-                                });
-                        }}
-                        style={{
-                            padding: "8px 16px",
-                            background: "white",
-                            color: "#1a73e8",
-                            border: "1px solid #1a73e8",
-                            borderRadius: 6,
-                            cursor: "pointer",
-                            fontSize: 13,
-                            fontWeight: 500,
-                        }}
-                    >
+                    <SummaryBadges summary={report.summary} />
+                </div>
+                <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
+                    <button onClick={() => {
+                        fetch(`${API_BASE}/align/export`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ markdown: report.markdown, arxiv_id: report.paper.arxivId }),
+                        })
+                            .then(res => res.blob())
+                            .then(blob => {
+                                const url = URL.createObjectURL(blob);
+                                const a = document.createElement("a");
+                                a.href = url;
+                                a.download = `align-${report.paper.arxivId}-${Date.now()}.md`;
+                                a.click();
+                                URL.revokeObjectURL(url);
+                            });
+                    }} style={{ padding: "8px 16px", background: "#1a73e8", color: "white", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 13, fontWeight: 500 }}>
                         📥 导出报告 (.md)
                     </button>
                 </div>
             </div>
 
-            {/* 两栏 */}
-            <div style={{
-                display: "grid",
-                gridTemplateColumns: "minmax(380px, 1fr) minmax(0, 1.4fr)",
-                gap: 12,
-                minHeight: 600,
-            }}>
-                {/* 左：分层列表 */}
-                <div style={{ background: "white", border: "1px solid #e0e0e0", borderRadius: 8, overflow: "auto", maxHeight: "75vh" }}>
-                    {hasComponents ? (
-                        components.map(({ component, rows }) => {
-                            const isExpanded = expandedComponents[component.name] ?? true;
-                            const pm = PRIORITY_META[component.priority] ?? PRIORITY_META[3];
-                            const matchCount = rows.filter(r => r.status === 'match' || r.status === 'partial').length;
-
-                            return (
-                                <div key={component.name}>
-                                    <div
-                                        onClick={() => onToggleComponent(component.name)}
-                                        style={{
-                                            padding: "10px 14px",
-                                            background: "#f8f9fa",
-                                            borderBottom: "1px solid #e0e0e0",
-                                            cursor: "pointer",
-                                            display: "flex",
-                                            alignItems: "center",
-                                            gap: 8,
-                                            position: "sticky",
-                                            top: 0,
-                                            zIndex: 1,
-                                        }}
-                                    >
-                                        <span style={{ fontSize: 11, color: "#666" }}>{isExpanded ? "▼" : "▶"}</span>
-                                        <span style={{ fontSize: 12, fontWeight: 600, color: pm.color }}>
-                                            {pm.icon} {pm.label}
-                                        </span>
-                                        <span style={{ fontSize: 13, fontWeight: 600 }}>{component.name}</span>
-                                        <span style={{ fontSize: 11, color: "#999", marginLeft: "auto" }}>
-                                            {matchCount}/{rows.length} 匹配
-                                        </span>
-                                    </div>
-                                    {isExpanded && rows.map(row => {
-                                        const originalIndex = report.rows.indexOf(row);
-                                        return (
-                                            <ClaimCard
-                                                key={originalIndex}
-                                                index={originalIndex}
-                                                row={row}
-                                                selected={originalIndex === selectedIndex}
-                                                onClick={() => onSelect(originalIndex)}
-                                            />
-                                        );
-                                    })}
-                                </div>
-                            );
-                        })
-                    ) : (
-                        report.rows.map((row, i) => (
-                            <ClaimCard key={i} index={i} row={row} selected={i === selectedIndex} onClick={() => onSelect(i)} />
-                        ))
-                    )}
-                </div>
-
-                {/* 右：代码 */}
-                <div style={{ position: "sticky", top: 0, alignSelf: "start" }}>
-                    <RightPane row={report.rows[selectedIndex]} />
-                </div>
+            {/* Markdown 报告预览 */}
+            <div className="report-md" style={{ background: "white", border: "1px solid #e0e0e0", borderRadius: 8, padding: "16px 24px", maxHeight: "80vh", overflow: "auto", lineHeight: 1.7, fontSize: 14 }}>
+                <style>{mdStyle}</style>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{report.markdown}</ReactMarkdown>
             </div>
-
-            {/* 论文总结 */}
-            <PaperSummary rows={report.rows} />
-        </div>
-    );
-}
-
-// ───────────── Q&A 卡片 ─────────────
-
-function ClaimCard({
-    index,
-    row,
-    selected,
-    onClick,
-}: {
-    index: number;
-    row: AlignmentRow;
-    selected: boolean;
-    onClick: () => void;
-}) {
-    const meta = STATUS_META[row.status];
-    const typeMeta = row.claim.type ? CLAIM_TYPE_META[row.claim.type] : undefined;
-    const importance = row.claim.importance ?? 2;
-    return (
-        <div
-            onClick={onClick}
-            style={{
-                padding: "12px 14px",
-                borderBottom: "1px solid #f1f3f4",
-                cursor: "pointer",
-                background: selected ? "#e8f0fe" : "transparent",
-                borderLeft: selected ? "3px solid #1a73e8" : "3px solid transparent",
-                transition: "background 0.1s",
-            }}
-        >
-            {/* 顶部徽标 */}
-            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6, flexWrap: "wrap" }}>
-                <span style={{ background: meta.bg, color: meta.color, padding: "2px 8px", borderRadius: 10, fontSize: 11, fontWeight: 600 }}>
-                    {meta.icon} {meta.label}
-                </span>
-                {typeMeta && (
-                    <span style={{ color: typeMeta.color, fontSize: 11, fontWeight: 600, background: `${typeMeta.color}14`, padding: "2px 8px", borderRadius: 10 }}>
-                        {typeMeta.icon} {typeMeta.label}
-                    </span>
-                )}
-                <span style={{ fontSize: 11, color: importance === 3 ? "#e37400" : importance === 2 ? "#5f6368" : "#bdc1c6", letterSpacing: 1, fontWeight: 600 }}
-                    title={`重要度 ${importance}/3`}
-                >
-                    {"★".repeat(importance)}
-                    <span style={{ color: "#dadce0" }}>{"★".repeat(3 - importance)}</span>
-                </span>
-                <span style={{ fontSize: 11, color: "#999", marginLeft: "auto" }}>
-                    #{index + 1} · {row.claim.location}
-                </span>
-            </div>
-
-            {/* 描述 */}
-            <div style={{ fontSize: 14, color: "#202124", fontWeight: importance === 3 ? 600 : 500, marginBottom: 4, lineHeight: 1.4 }}>
-                {row.claim.description}
-            </div>
-
-            {/* 引用 */}
-            {row.claim.quote && (
-                <div style={{ fontSize: 12, color: "#5f6368", fontStyle: "italic", borderLeft: "2px solid #dadce0", paddingLeft: 8, margin: "4px 0 6px", lineHeight: 1.5, maxHeight: 50, overflow: "hidden", textOverflow: "ellipsis", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}
-                    title={row.claim.quote}
-                >
-                    "{row.claim.quote}"
-                </div>
-            )}
-
-            {/* 对齐说明 */}
-            <div style={{ fontSize: 12, color: "#5f6368", lineHeight: 1.5 }}>{row.note}</div>
-
-            {/* 证据行预览 */}
-            {row.evidenceSpans && row.evidenceSpans.length > 0 && (
-                <div style={{ marginTop: 4, display: "flex", gap: 4, flexWrap: "wrap" }}>
-                    {row.evidenceSpans.map((s, i) => (
-                        <span key={i} style={{ fontSize: 10, background: "#0e639c14", color: "#0e639c", padding: "1px 6px", borderRadius: 3, fontFamily: "monospace" }}>
-                            L{s.startLine}-{s.endLine}
-                        </span>
-                    ))}
-                </div>
-            )}
-
-            {/* 底部 */}
-            {row.matchedFunction && (
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 6, fontSize: 11, color: "#5f6368", fontFamily: "monospace" }}>
-                    <span>
-                        📍 {row.matchedFunction.file} · L{row.matchedFunction.startLine}-{row.matchedFunction.endLine}
-                    </span>
-                    <span style={{ color: confidenceColor(row.confidence), fontWeight: 600 }}>
-                        {(row.confidence * 100).toFixed(0)}%
-                    </span>
-                </div>
-            )}
-        </div>
-    );
-}
-
-function confidenceColor(c: number): string {
-    if (c >= 0.85) return "#0d652d";
-    if (c >= 0.65) return "#9a6700";
-    if (c >= 0.4) return "#e37400";
-    return "#a50e0e";
-}
-
-// ───────────── 右侧代码面板 ─────────────
-
-function RightPane({ row }: { row: AlignmentRow | undefined }) {
-    if (!row) {
-        return <EmptyPane text="选择左侧的 claim 以查看对应代码" />;
-    }
-
-    const meta = STATUS_META[row.status];
-
-    if (!row.matchedFunction) {
-        return (
-            <div style={paneStyle}>
-                <div style={{ padding: 24, textAlign: "center", color: "#5f6368" }}>
-                    <div style={{ fontSize: 48, marginBottom: 8 }}>{meta.icon}</div>
-                    <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 4, color: meta.color }}>
-                        {row.claim.description}
-                    </div>
-                    <div style={{ fontSize: 13, color: "#5f6368", marginTop: 8 }}>
-                        {row.status === "missing"
-                            ? "代码中未找到对应的实现"
-                            : row.note}
-                    </div>
-                    <ReasoningPanel reasoning={row.reasoning} />
-                </div>
-            </div>
-        );
-    }
-
-    const focusLine = row.evidenceLine ?? row.matchedFunction.startLine;
-
-    return (
-        <div style={paneStyle}>
-            <CodeViewer
-                code={row.matchedFunction.body}
-                filePath={row.matchedFunction.file}
-                language="python"
-                highlightRange={{
-                    start: row.matchedFunction.startLine,
-                    end: row.matchedFunction.endLine,
-                }}
-                focusLine={focusLine}
-                lineNumberStart={row.matchedFunction.startLine}
-                contextWindow={4}
-                maxHeight={520}
-            />
-
-            <div style={{ marginTop: 8, padding: 12, background: "#f8f9fa", borderRadius: 6, fontSize: 13, lineHeight: 1.6 }}>
-                {/* 状态 */}
-                <div style={{ marginBottom: 4, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                    <span style={{ background: meta.bg, color: meta.color, padding: "2px 8px", borderRadius: 10, fontSize: 11, fontWeight: 600 }}>
-                        {meta.icon} {meta.label}
-                    </span>
-                    <span style={{ color: "#666", fontSize: 12 }}>
-                        置信度 <strong style={{ color: confidenceColor(row.confidence) }}>{(row.confidence * 100).toFixed(0)}%</strong>
-                    </span>
-                </div>
-                <div style={{ color: "#202124" }}>{row.note}</div>
-
-                {/* Evidence 行范围 */}
-                {row.evidenceSpans && row.evidenceSpans.length > 0 && (
-                    <div style={{ marginTop: 8 }}>
-                        <div style={{ fontWeight: 600, fontSize: 12, color: "#5f6368", marginBottom: 4 }}>📐 公式-代码对应：</div>
-                        {row.evidenceSpans.map((span, i) => (
-                            <div key={i} style={{
-                                marginBottom: 6,
-                                padding: "6px 10px",
-                                background: "#0e639c08",
-                                borderLeft: "3px solid #0e639c",
-                                borderRadius: 3,
-                                fontSize: 12,
-                            }}>
-                                <div style={{ fontFamily: "monospace", color: "#0e639c", marginBottom: 2 }}>
-                                    L{span.startLine}-{span.endLine}
-                                    {span.formulaContext && <span style={{ color: "#666", marginLeft: 8 }}>← {span.formulaContext}</span>}
-                                </div>
-                                {span.variableMappings && span.variableMappings.length > 0 && (
-                                    <div style={{ marginTop: 2, fontSize: 11, color: "#5f6368" }}>
-                                        {span.variableMappings.map((vm, j) => (
-                                            <span key={j} style={{ marginRight: 8 }}>
-                                                <strong>{vm.formulaVar}</strong> → <code>{vm.codeVar}</code>
-                                                {vm.context ? <span style={{ color: "#999" }}> ({vm.context})</span> : ''}
-                                            </span>
-                                        ))}
-                                    </div>
-                                )}
-                                <div style={{ marginTop: 4, fontFamily: "monospace", fontSize: 11, color: "#202124", whiteSpace: "pre-wrap", maxHeight: 80, overflow: "hidden" }}>
-                                    {span.codeSnippet.slice(0, 200)}
-                                </div>
-                            </div>
-                        ))}
-                    </div>
-                )}
-
-                {/* 旧版 evidence */}
-                {row.evidence && (!row.evidenceSpans || row.evidenceSpans.length === 0) && (
-                    <div style={{ marginTop: 8, padding: "6px 10px", background: "#0e639c14", borderLeft: "3px solid #0e639c", borderRadius: 3, fontSize: 12, fontFamily: "ui-monospace, Menlo, monospace", color: "#0e639c" }}>
-                        <span style={{ fontWeight: 600, color: "#5f6368" }}>🔍 证据：</span>
-                        {row.evidence}
-                    </div>
-                )}
-
-                <ReasoningPanel reasoning={row.reasoning} />
-            </div>
-        </div>
-    );
-}
-
-/** 可展开的推理过程面板 */
-function ReasoningPanel({ reasoning }: { reasoning?: string }) {
-    const [open, setOpen] = useState(false);
-    if (!reasoning) return null;
-    return (
-        <div style={{ marginTop: 8 }}>
-            <button
-                onClick={() => setOpen((o) => !o)}
-                style={{ background: "transparent", border: "none", color: "#1a73e8", fontSize: 12, cursor: "pointer", padding: 0, fontFamily: "inherit" }}
-            >
-                {open ? "▼" : "▶"} 💡 {open ? "隐藏推理" : "显示推理"}
-            </button>
-            {open && (
-                <div style={{ marginTop: 4, padding: 8, background: "white", border: "1px solid #e0e0e0", borderRadius: 4, fontSize: 12, color: "#5f6368", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
-                    {reasoning}
-                </div>
-            )}
-        </div>
-    );
-}
-
-/** 论文总结组件：按重要度分条展示论文核心声明 */
-function PaperSummary({ rows }: { rows: AlignmentReport["rows"] }) {
-    const [collapsed, setCollapsed] = useState(true);
-    const coreClaims = rows.filter(r => (r.claim.importance ?? 2) === 1);
-    const supportClaims = rows.filter(r => (r.claim.importance ?? 2) === 2);
-    const detailClaims = rows.filter(r => (r.claim.importance ?? 2) === 3);
-
-    return (
-        <div style={{ marginTop: 16, background: "white", border: "1px solid #e0e0e0", borderRadius: 8 }}>
-            <div
-                onClick={() => setCollapsed(!collapsed)}
-                style={{
-                    padding: "12px 16px",
-                    cursor: "pointer",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 8,
-                    userSelect: "none",
-                    borderBottom: collapsed ? "none" : "1px solid #e0e0e0",
-                }}
-            >
-                <span style={{ fontSize: 14, color: "#666" }}>{collapsed ? "▶" : "▼"}</span>
-                <span style={{ fontSize: 15, fontWeight: 600, color: "#202124" }}>📝 论文总结</span>
-                <span style={{ fontSize: 12, color: "#999" }}>{rows.length} 个声明</span>
-            </div>
-            {!collapsed && (
-                <div style={{ padding: "8px 16px 16px" }}>
-                    {coreClaims.length > 0 && (
-                        <div style={{ marginBottom: 12 }}>
-                            <div style={{ fontSize: 13, fontWeight: 600, color: "#c62828", marginBottom: 6 }}>🔴 核心贡献</div>
-                            {coreClaims.map((r, i) => (
-                                <div key={i} style={{ fontSize: 13, color: "#333", padding: "3px 0 3px 16px", lineHeight: 1.5 }}>
-                                  • {r.claim.description}
-                                </div>
-                            ))}
-                        </div>
-                    )}
-                    {supportClaims.length > 0 && (
-                        <div style={{ marginBottom: 12 }}>
-                            <div style={{ fontSize: 13, fontWeight: 600, color: "#f9a825", marginBottom: 6 }}>🟡 支撑组件</div>
-                            {supportClaims.map((r, i) => (
-                                <div key={i} style={{ fontSize: 13, color: "#333", padding: "3px 0 3px 16px", lineHeight: 1.5 }}>
-                                  • {r.claim.description}
-                                </div>
-                            ))}
-                        </div>
-                    )}
-                    {detailClaims.length > 0 && (
-                        <div>
-                            <div style={{ fontSize: 13, fontWeight: 600, color: "#1565c0", marginBottom: 6 }}>🔵 实现细节</div>
-                            {detailClaims.map((r, i) => (
-                                <div key={i} style={{ fontSize: 13, color: "#333", padding: "3px 0 3px 16px", lineHeight: 1.5 }}>
-                                  • {r.claim.description}
-                                </div>
-                            ))}
-                        </div>
-                    )}
-                </div>
-            )}
-        </div>
-    );
-}
-
-function EmptyPane({ text }: { text: string }) {
-    return (
-        <div style={{ ...paneStyle, display: "flex", alignItems: "center", justifyContent: "center", color: "#999", fontSize: 14, minHeight: 400 }}>
-            {text}
         </div>
     );
 }
