@@ -129,6 +129,13 @@ npm run dev:web
 
 Web 默认运行在 `http://localhost:5173`，网关在 `http://localhost:4000`。
 
+> **环境准备说明**：
+> - **Node.js ≥ 18** + **npm ≥ 9** 是基础，项目已配置好所有依赖，`npm install` 即可
+> - **Ollama** 用于本地推理，首次使用需 `ollama pull gemma4:31b-cloud` 和 `ollama pull shaw/dmeta-embedding-zh`
+> - **GitHub Token**（可选但推荐）：创建 [Personal Access Token](https://github.com/settings/tokens) 设为 `GITHUB_TOKEN`，避免 GitHub API 限流（未设置时匿名请求每小时最多 60 次，对齐大仓库可能失败）
+> - **代理**（可选）：在国内访问 GitHub API 较慢时，设置 `HTTPS_PROXY=http://127.0.0.1:7897`（或你的代理端口）加速仓库抓取
+> - 以上环境变量可写入项目根目录的 `.env` 文件（参考 `.env.example`）
+
 ---
 
 ## 运行
@@ -606,6 +613,8 @@ Chat Agent 通过 `agent.registerTool('align_paper', ...)` 将 PaperAlignAgent �
 | npm | >= 9 | 包管理 |
 | Ollama | 最新 | 本地 LLM / Embeddings |
 | TypeScript | 5.7+ | 编译 |
+| GitHub Token | 可选 | 避免 GitHub API 429 限流 |
+| HTTPS 代理 | 可选 | 加速 GitHub 仓库抓取（国内环境）|
 
 ```bash
 ollama pull gemma4:31b-cloud
@@ -617,7 +626,7 @@ ollama serve
 
 ## 配置
 
-环境变量：
+环境变量（可写入项目根目录 `.env` 文件）：
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
