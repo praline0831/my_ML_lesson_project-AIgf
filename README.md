@@ -45,7 +45,7 @@
 | **论文-代码对齐** | 两阶段论文解析（组件 → claims）→ 关键词检索候选函数 → 逐 claim LLM 判读匹配 → 公式-代码行级证据提取 → 对齐结果输出 Markdown 报告，一键导出 |
 | **Markdown + LaTeX 渲染** | react-markdown + remark-gfm + remark-math + rehype-katex |
 | **流式接口** | SSE (Server-Sent Events) 实时返回 token、节点轨迹、确认请求、错误 |
-| **本地 LLM** | 通过 Ollama 运行本地模型（gemma4:31b-cloud / kimi-k2.5:cloud） |
+| **本地 LLM** | 通过 Ollama 运行本地模型（gemma4:31b-cloud / kimi-k2.5:cloud）；也支持 OpenAI 兼容 API（改 `LLM_ENDPOINT` / `LLM_API_KEY` 即可） |
 
 ---
 
@@ -513,6 +513,8 @@ GitHub repo -> RepoFetcher (文件树 + 候选 .py 文件)
 - match = 函数体内确实实现了 claim 描述的操作
 - missing = 找不到对应实现（不强行造假）
 
+也支持 OpenAI 兼容 API，改 `LLM_ENDPOINT` / `LLM_API_KEY` 即可。
+
 **LLM 适配**：
 
 ```typescript
@@ -619,7 +621,7 @@ ollama serve
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `LLM_ENDPOINT` | `http://localhost:11434` | Ollama API 地址 |
+| `LLM_ENDPOINT` | `http://localhost:11434/v1` | Ollama API 地址（也可填 OpenAI 等兼容服务） |
 | `LLM_MODEL` | `gemma4:31b-cloud` | 对话模型 |
 | `LLM_API_KEY` | `ollama` | API Key |
 | `LLM_MAX_TOKENS` | `8192` | 最大输出 token |
